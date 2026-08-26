@@ -324,7 +324,7 @@ data/
 
 The three WAV files are dummy examples used only to validate input handling. The sample submission has three rows and six columns: one identifier column and the five prediction columns.
 
-The original public package also contained a baseline submission archive with source code, model configuration, and pretrained weights. This workspace intentionally retains only the source/configuration files and omits the large weight files from both the working tree and Git history.
+The original public package also contained a baseline submission archive with source code, model configuration, and pretrained weights. The three required baseline checkpoints are present locally under `baseline/model/`, but are excluded from Git because of their size.
 
 ## 18. Repository layout
 
@@ -416,14 +416,14 @@ For a real local model run, the omitted pretrained weights must be supplied sepa
 
 4. Confirm that PyTorch and TorchAudio are available and compatible with the selected CPU/CUDA configuration.
 5. Inspect `data/sample_submission.csv` and the three dummy files to validate file discovery and output formatting.
-6. Keep all large model weights outside Git and ensure they are present under `baseline/model/` only when performing a local inference experiment.
+6. Keep all large model weights outside Git while ensuring the required checkpoints are present under `baseline/model/` for local inference and submission packaging.
 7. Ensure any submission archive has exactly `model/`, `script.py`, and `requirements.txt` at its top level.
 8. Confirm that inference writes `output/submission.csv` and that all five probabilities are within `[0, 1]`.
 
 ## 21. Current repository state
 
 - Git repository initialized locally.
-- Large model weight files excluded.
+- Large model weight files present locally but excluded from Git.
 - Public dummy data retained.
 - Baseline source and configuration retained.
 - Local environment management is based on `uv`.

@@ -1,5 +1,7 @@
 # Local uv environment.
 .venv/
+__pycache__/
+*.py[cod]
 
 # Large model artifacts are intentionally excluded from this repository.
 *.bin
