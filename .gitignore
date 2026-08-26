@@ -1,0 +1,9 @@
+# Large model artifacts are intentionally excluded from this repository.
+*.bin
+*.pth
+*.th
+*.ckpt
+*.safetensors
+*.pt
+*.onnx
+*.zip
