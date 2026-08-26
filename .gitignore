@@ -1,3 +1,6 @@
+# Local uv environment.
+.venv/
+
 # Large model artifacts are intentionally excluded from this repository.
 *.bin
 *.pth
