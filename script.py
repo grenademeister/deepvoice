@@ -29,7 +29,7 @@ from demucs.separate import load_track
 from tqdm import tqdm
 
 # v1: 로컬 SONICS 추론 모듈 (awsaf49/sonics-spectttra-alpha-5s).
-from sonics_infer import load_sonics_model, predict_fake as predict_sonics_fake
+from temporal_aggregation import aggregate_temporal_scores
 
 
 # 경로 설정
@@ -52,6 +52,7 @@ AUDIO_SAMPLE_RATE = 16_000
 PANNS_SAMPLE_RATE = 32_000
 SEGMENT_SAMPLES = 64_600
 SILENCE_RMS = 1e-5
+PRESENCE_THRESHOLD = 0.3  # minimum presence to consider a component present
 
 PREDICTION_COLUMNS = [
     "FILE_FAKE_PROB",
@@ -365,7 +366,7 @@ def predict_fake(model, fake_label_index, audio, device):
             probabilities = torch.softmax(logits.float(), dim=-1)
         segment_scores.append(float(probabilities[0, fake_label_index]))
 
-    return max(segment_scores)
+    return aggregate_temporal_scores(segment_scores)
 
 
 # -----------------------------------------------------------------------------
@@ -373,9 +374,8 @@ def predict_fake(model, fake_label_index, audio, device):
 # -----------------------------------------------------------------------------
 
 def combine_file_fake_score(voice_fake, music_fake, voice_present, music_present):
-    voice_score = voice_present * voice_fake
-    music_score = music_present * music_fake
-    return max(voice_score, music_score)
+    """Use max of component fake scores — ignores presence which hurts calibration."""
+    return max(voice_fake, music_fake)
 
 
 def predict_fake_scores_for_all_files(
@@ -383,26 +383,29 @@ def predict_fake_scores_for_all_files(
 ):
     df_arena_model, fake_label_index = load_df_arena_model(device)
     htdemucs_model = load_htdemucs_model()
-    # v1: 음악 성분 전용 AI 생성 음악 탐지기 (SONICS) 를 추가로 로드한다.
-    sonics_model = load_sonics_model(SONICS_DIR, device)
+    sonics_model = None  # DF-Arena replaces SONICS for music
 
     for index, audio_path in enumerate(tqdm(audio_files, desc="Components")):
-        voice_audio, music_audio = separate_voice_and_music(
+        voice_stem, music_stem = separate_voice_and_music(
             audio_path, htdemucs_model, device
         )
         voice_fake = predict_fake(
-            df_arena_model, fake_label_index, voice_audio, device
+            df_arena_model, fake_label_index, voice_stem, device
         )
-        # v1: MUSIC_FAKE_PROB 는 DF-Arena 대신 SONICS AI 생성 음악 탐지기를 사용한다.
-        music_fake = predict_sonics_fake(sonics_model, music_audio, AUDIO_SAMPLE_RATE, device=device)
-        # 베이스라인과 동일하게 무음 구간은 fake 로 취급하지 않는다.
-        if calculate_rms(music_audio) < SILENCE_RMS:
+        music_fake = predict_fake(
+            df_arena_model, fake_label_index, music_stem, device
+        )
+        if calculate_rms(music_stem) < SILENCE_RMS:
             music_fake = 0.0
 
         voice_present, music_present = presence_scores[audio_path.stem]
-        file_fake = combine_file_fake_score(
-            voice_fake, music_fake, voice_present, music_present
+
+        # FILE_FAKE: DF-Arena on raw audio (decoupled from music)
+        audio = load_audio(audio_path)
+        raw_fake = predict_fake(
+            df_arena_model, fake_label_index, audio, device
         )
+        file_fake = max(raw_fake, voice_fake)
 
         row = submission_rows[index]
         row["FILE_FAKE_PROB"] = round(file_fake, 10)
