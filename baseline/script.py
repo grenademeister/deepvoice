@@ -26,7 +26,11 @@ from tqdm import tqdm
 
 # 경로 설정
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "model"
+# 로컬 개발에서는 모델 버전들이 루트 model/ 가중치를 공유한다.
+# 단독 제출 패키지에서는 script.py 옆의 model/ 구조도 지원한다.
+SHARED_MODEL_DIR = BASE_DIR.parent / "model"
+LOCAL_MODEL_DIR = BASE_DIR / "model"
+MODEL_DIR = SHARED_MODEL_DIR if SHARED_MODEL_DIR.is_dir() else LOCAL_MODEL_DIR
 DF_ARENA_DIR = MODEL_DIR / "df_arena_1b"
 HTDEMUCS_DIR = MODEL_DIR / "htdemucs"
 PANNS_DIR = MODEL_DIR / "panns"

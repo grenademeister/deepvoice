@@ -245,6 +245,12 @@ wheels = [
 name = "deepvoice-dacon-236749"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "demucs" },
+    { name = "librosa" },
+    { name = "torch" },
+    { name = "torchaudio" },
+]
 
 [package.dev-dependencies]
 runtime = [
@@ -274,6 +280,12 @@ runtime = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "demucs", specifier = ">=4.0.1" },
+    { name = "librosa", specifier = ">=0.10.2.post1" },
+    { name = "torch", specifier = ">=2.13.0" },
+    { name = "torchaudio", specifier = ">=2.11.0" },
+]
 
 [package.metadata.requires-dev]
 runtime = [

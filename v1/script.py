@@ -14,10 +14,10 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 sys.dont_write_bytecode = True
 
-# v1: model 폴더의 로컬 추론 모듈을 import 할 수 있도록 경로를 추가한다.
-MODEL_DIR = Path(__file__).resolve().parent / "model"
-if str(MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(MODEL_DIR))
+# v1 전용 로컬 추론 모듈(SONICS)을 import 할 수 있도록 경로를 추가한다.
+LOCAL_MODEL_DIR = Path(__file__).resolve().parent / "model"
+if str(LOCAL_MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(LOCAL_MODEL_DIR))
 
 import librosa
 import numpy as np
@@ -34,11 +34,14 @@ from sonics_infer import load_sonics_model, predict_fake as predict_sonics_fake
 
 # 경로 설정
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "model"
+# 로컬 개발에서는 모델 버전들이 루트 model/ 가중치를 공유한다.
+# 단독 제출 패키지에서는 script.py 옆의 model/ 구조도 지원한다.
+SHARED_MODEL_DIR = BASE_DIR.parent / "model"
+MODEL_DIR = SHARED_MODEL_DIR if SHARED_MODEL_DIR.is_dir() else LOCAL_MODEL_DIR
 DF_ARENA_DIR = MODEL_DIR / "df_arena_1b"
 HTDEMUCS_DIR = MODEL_DIR / "htdemucs"
 PANNS_DIR = MODEL_DIR / "panns"
-SONICS_DIR = MODEL_DIR / "sonics"
+SONICS_DIR = LOCAL_MODEL_DIR / "sonics"
 
 DEFAULT_TEST_DIR = Path("data") / "test"
 DEFAULT_SAMPLE_SUBMISSION = Path("data") / "sample_submission.csv"

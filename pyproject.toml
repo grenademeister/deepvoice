@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Workspace for the DACON AI Deepvoice Detection Challenge"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-dependencies = []
+dependencies = [
+    "demucs>=4.0.1",
+    "librosa>=0.10.2.post1",
+    "torch>=2.13.0",
+    "torchaudio>=2.11.0",
+]
 
 [dependency-groups]
 # Libraries needed to run baseline/script.py locally. CUDA-enabled PyTorch is

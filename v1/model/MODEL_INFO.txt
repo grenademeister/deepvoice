@@ -1,15 +1,8 @@
-DF-Arena 1B
-- Source: Speech-Arena-2025/DF_Arena_1B_V_1
-- Revision: fb6ce85de12c2c5a509d89114adaf827dd75f49f
-- Local directory: df_arena_1b
-
-HTDemucs
-- Model: htdemucs (955717e8-8726e21a)
-- Local directory: htdemucs
-
-PANNs Cnn14
-- Checkpoint: Cnn14_mAP=0.431.pth
-- Local directory: panns
+Shared models
+- DF-Arena 1B, HTDemucs, and PANNs are stored in the repository-level
+  model/ directory during local development.
+- Copy those directories into this model/ directory when assembling a
+  standalone v1 submission.
 
 SONICS SpecTTTra-alpha (v1 addition)
 - Purpose: AI-generated MUSIC detection (replaces DF-Arena for MUSIC_FAKE_PROB)
