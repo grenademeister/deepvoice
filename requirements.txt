@@ -1,6 +1,5 @@
 # Local runtime dependencies for `uv pip install -r requirements.txt`.
-# Install the appropriate torch and torchaudio builds separately for the
-# target CPU/CUDA environment.
+# PyTorch and TorchAudio are supplied by the evaluation environment.
 accelerate==1.9.0
 demucs==4.0.1
 einops==0.8.1

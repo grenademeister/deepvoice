@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 # v1: 로컬 SONICS 추론 모듈 (awsaf49/sonics-spectttra-alpha-5s).
 from sonics_infer import load_sonics_model, predict_fake as predict_sonics_fake
+from temporal_aggregation import aggregate_temporal_scores
 
 
 # 경로 설정
@@ -365,7 +366,7 @@ def predict_fake(model, fake_label_index, audio, device):
             probabilities = torch.softmax(logits.float(), dim=-1)
         segment_scores.append(float(probabilities[0, fake_label_index]))
 
-    return max(segment_scores)
+    return aggregate_temporal_scores(segment_scores)
 
 
 # -----------------------------------------------------------------------------
