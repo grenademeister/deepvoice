@@ -418,6 +418,7 @@ def predict_fake_scores_for_all_files(
             artifact_raw=artifact_raw,
             artifact_stem=artifact_stem,
             music_present=music_present,
+            voice_present=voice_present,
         )
 
         row = submission_rows[index]
