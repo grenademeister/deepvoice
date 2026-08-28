@@ -49,3 +49,21 @@ Full fine-tuning of 16.8M params on 370 files → severe overfitting (train_loss
 | 2 | | | |
 | 3 | | | |
 | 4 | | | |
+
+## Step 5: ArtifactNet v2
+
+**Status:** Implemented and validated 2026-08-28 (GTX 1080, 144 validation q90, `split=validation`)
+
+ArtifactNet v9.4 runs independently on raw 44.1 kHz audio and the native-rate HTDemucs music stem. `MUSIC_FAKE_PROB` uses the maximum of the two median-over-chunk probabilities. File-level ArtifactNet evidence is gated by PANNs music presence and fused with the existing DF-Arena raw/voice score. Validated on same 144 validation as v0 q90; wall 407s→408s (+0.2%), VRAM 5.20G→6.25G.
+
+| Metric | v0 q90 (2026-08-28) | v2 | Change |
+|---|---:|---:|---:|
+| **Score** | 0.82582 | **0.87028** | **+4.45 pts** |
+| ADS | 0.80706 | **0.85646** | +4.94 pts |
+| CPS | 0.99466 | 0.99466 | — |
+| FileEER | 0.15274 | **0.13838** | -9.4% |
+| VoiceEER | 0.03006 | 0.03006 | unchanged |
+| MusicEER | 0.36851 | **0.22777** | **-38.2%** |
+| Wall 144 (GTX) | 407s | 408s | +0.2% |
+| Wall 1200 extrap GTX | 56.5 min | 56.7 min | <60 min |
+| Wall 1200 extrap L4 22.4G | ~32 min | ~33 min | <60 min |

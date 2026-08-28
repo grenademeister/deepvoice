@@ -2,8 +2,8 @@
 
 Project: **DACON 236749 AI Deepvoice Detection Challenge**  
 Deadline: **September 29, 2026**  
-Current Score (baseline, 144 validation): **0.8072**  
-Primary bottleneck: **MusicEER = 0.2981** (10× worse than VoiceEER = 0.030)
+Current Score (v2, 144 validation q90): **0.87028** — v0 q90 **0.82582**  
+Primary bottleneck (v0): **MusicEER = 0.3685** → v2 **0.2277** (-38%) — VoiceEER 0.030 stable
 
 ---
 
@@ -11,16 +11,17 @@ Primary bottleneck: **MusicEER = 0.2981** (10× worse than VoiceEER = 0.030)
 
 ```
 deepvoice/
-├── script.py                    # Inference pipeline (entry point)
-├── requirements.txt             # Competition submission deps
+├── script.py                    # Inference pipeline (entry point) — v2: DF-Arena + ArtifactNet
+├── requirements.txt             # Competition submission deps (+ onnxruntime-gpu 1.22.0)
 ├── model/
 │   ├── df_arena_1b/             # Voice fake detector (Wav2Vec2-XLS-R 1B)
 │   │   └── pytorch_model.bin    # 4.3 GB — excluded from git
-│   ├── sonics/                  # Music fake detector (SpecTTTra)
-│   │   ├── config.json
-│   │   └── pytorch_model.bin    # 65 MB
-│   ├── sonics_infer.py          # Self-contained SONICS inference
-│   ├── temporal_aggregation.py  # Window score aggregation (max / q90)
+│   ├── artifactnet/             # Music fake detector (ArtifactNet v9.4 ONNX, 17M)
+│   │   ├── artifactnet_v94_full.onnx
+│   │   └── artifactnet_v94_full.onnx.data
+│   ├── artifactnet_infer.py     # ArtifactNet wrapper (44.1kHz, 4s median, ORT CUDA/CPU)
+│   ├── v2_fusion.py             # FILE_FAKE = max(df_raw, df_voice, mp*max(a_raw,a_stem))
+│   ├── temporal_aggregation.py  # DF-Arena q90 aggregation (quantile 0.90)
 │   ├── htdemucs/                # Source separation (Demucs)
 │   │   ├── htdemucs.yaml
 │   │   └── 955717e8-8726e21a.th  # 81 MB
@@ -28,12 +29,10 @@ deepvoice/
 │       ├── Cnn14_mAP=0.431.pth   # 313 MB
 │       ├── class_labels_indices.csv
 │       └── component_labels.json
-├── tools/
-│   ├── evaluate_validation.py   # Run 3 variants + compute metrics
-│   ├── compute_metrics.py       # Standalone metric computation
-│   ├── train_adapter.py         # Fusion calibrator / voice adapter training
-│   └── diagnose_music.py        # Error analysis by domain/source
-├── .venv311/                    # Python 3.11 venv with all deps
+├── tests/
+│   ├── test_artifactnet_infer.py
+│   ├── test_v2_fusion.py
+│   └── test_temporal_aggregation.py
 └── data/
     └── test/                    # 3 dummy WAVs (format validation only)
 ```
@@ -44,31 +43,37 @@ deepvoice/
 
 ---
 
-## 2. Inference pipeline (`script.py`)
+## 2. Inference pipeline (`script.py`) — v2
 
 ```
 Raw audio → [PANNs] → presence (voice, music)
-          → [HTDemucs] → source separation → voice stem, music stem
-          → [DF-Arena 1B] on voice stem → VOICE_FAKE_PROB
-          → [SONICS SpecTTTra] on music stem → MUSIC_FAKE_PROB
-          → Fusion: FILE_FAKE = max(presence_voice × voice_fake, 
-                                     presence_music × music_fake)
+          → [HTDemucs] → voice stem (16k) + music stem (native 44.1k preserved)
+          → [DF-Arena 1B q90] on voice stem → VOICE_FAKE_PROB
+          → [DF-Arena 1B q90] on raw 16k → FILE evidence
+          → [ArtifactNet v9.4 ORT 44.1kHz, 4s median] on raw + music stem → MUSIC_FAKE = max(a_raw, a_stem)
+          → Fusion: FILE_FAKE = max(df_raw, df_voice, mp × music_fake)  // v2_fusion.py
 ```
 
-**All 3 models are loaded simultaneously on GPU.** DF-Arena (4.3B) alone fills most of the 8GB VRAM.
+**Validated 2026-08-28 on GTX 1080 8GB (144 validation, mean 11.58s):** v0 407s / 5.2G VRAM → v2 408s / 6.25G VRAM. DF-Arena q90 + ORT CUDA. All 3→2 DF passes + 2 AN passes load simultaneously — DF-Arena 1B fills most VRAM (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
 
 ---
 
-## 3. Current performance (144 validation files)
+## 3. Current performance (144 validation, q90, 2026-08-28 GTX 1080)
 
-| Metric | Value |
-|---|---|
-| **Score** | **0.8072** |
-| ADS | 0.7864 |
-| CPS | 0.9947 (near perfect) |
-| FileEER | 0.2363 |
-| VoiceEER | **0.0301** ← near ceiling |
-| MusicEER | **0.2981** ← main bottleneck |
+| Metric | v0 q90 | v2 ArtifactNet | Δ |
+|---|---|---|---|
+| **Score** | **0.82582** | **0.87028** | **+4.45 pts** |
+| ADS | 0.80706 | 0.85646 | +4.94 pts |
+| CPS | 0.99466 | 0.99466 | — |
+| FileEER | 0.15274 | **0.13838** | -9.4% |
+| VoiceEER | **0.03006** | **0.03006** | — |
+| MusicEER | 0.36851 | **0.22777** | **-38.2%** |
+| Wall (144) | 407s | 408s | +0.2% |
+| VRAM peak | 5.20G | 6.25G | +1.05G |
+| Extrap 1200 (GTX) | 56.5 min | 56.7 min | <60 min |
+| Extrap 1200 (L4 22.4G) | ~32 min | ~33 min | <60 min |
+
+**v2 validated on same validation split** (`split=validation`, n_file=144, n_voice=68, n_music=57). Previous `0.8072`/`0.2981` were stale max-aggregation numbers — superseded by q90 measurement.
 
 ---
 
