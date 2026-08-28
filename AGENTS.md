@@ -2,8 +2,8 @@
 
 Project: **DACON 236749 AI Deepvoice Detection Challenge**  
 Deadline: **September 29, 2026**  
-Current Score (v2, 144 validation q90): **0.87028** — v0 q90 **0.82582**  
-Primary bottleneck (v0): **MusicEER = 0.3685** → v2 **0.2277** (-38%) — VoiceEER 0.030 stable
+Current Score (v2 H1, 144 validation q90, 2026-08-28): **0.87939** — v2 **0.87028** → H1 `vp*df_voice`  
+Primary bottleneck (v0): **MusicEER = 0.3685** → v2 **0.2277** (-38%) — VoiceEER 0.030 stable — H1 `FileEER 0.138→0.118` via HTDemucs gate
 
 ---
 
@@ -43,37 +43,37 @@ deepvoice/
 
 ---
 
-## 2. Inference pipeline (`script.py`) — v2
+## 2. Inference pipeline (`script.py`) — v2 H1
 
 ```
 Raw audio → [PANNs] → presence (voice, music)
           → [HTDemucs] → voice stem (16k) + music stem (native 44.1k preserved)
-          → [DF-Arena 1B q90] on voice stem → VOICE_FAKE_PROB
+          → [DF-Arena 1B q90] on voice stem → VOICE_FAKE_PROB (gated by vp for file)
           → [DF-Arena 1B q90] on raw 16k → FILE evidence
           → [ArtifactNet v9.4 ORT 44.1kHz, 4s median] on raw + music stem → MUSIC_FAKE = max(a_raw, a_stem)
-          → Fusion: FILE_FAKE = max(df_raw, df_voice, mp × music_fake)  // v2_fusion.py
+          → Fusion: FILE_FAKE = max(df_raw, vp×df_voice, mp × music_fake)  // v2_fusion.py H1
 ```
 
-**Validated 2026-08-28 on GTX 1080 8GB (144 validation, mean 11.58s):** v0 407s / 5.2G VRAM → v2 408s / 6.25G VRAM. DF-Arena q90 + ORT CUDA. All 3→2 DF passes + 2 AN passes load simultaneously — DF-Arena 1B fills most VRAM (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
+**Validated 2026-08-28 on GTX 1080 8GB (144 validation, mean 11.58s):** v0 407s / 5.2G VRAM → v2 408s / 6.25G → H1 409s / 6.25G. DF-Arena q90 + AN median + vp gate. `FileEER 0.138→0.118` via suppressing `VOICE_FAKE 0.862` hallucination on music-only. H3 `median→q90` regressed to `0.84482`, H2 `avg` to `0.85393` — not shipped.
 
 ---
 
-## 3. Current performance (144 validation, q90, 2026-08-28 GTX 1080)
+## 3. Current performance (144 validation, q90, 2026-08-28 GTX 1080) — H1
 
-| Metric | v0 q90 | v2 ArtifactNet | Δ |
-|---|---|---|---|
-| **Score** | **0.82582** | **0.87028** | **+4.45 pts** |
-| ADS | 0.80706 | 0.85646 | +4.94 pts |
-| CPS | 0.99466 | 0.99466 | — |
-| FileEER | 0.15274 | **0.13838** | -9.4% |
-| VoiceEER | **0.03006** | **0.03006** | — |
-| MusicEER | 0.36851 | **0.22777** | **-38.2%** |
-| Wall (144) | 407s | 408s | +0.2% |
-| VRAM peak | 5.20G | 6.25G | +1.05G |
-| Extrap 1200 (GTX) | 56.5 min | 56.7 min | <60 min |
-| Extrap 1200 (L4 22.4G) | ~32 min | ~33 min | <60 min |
+| Metric | v0 q90 | v2 ArtifactNet | v2 H1 `vp*df_voice` | Δ H1 vs v2 |
+|---|---|---|---|---|
+| **Score** | **0.82582** | **0.87028** | **0.87939** | **+0.91 pts** |
+| ADS | 0.80706 | 0.85646 | **0.86658** | +1.01 pts |
+| CPS | 0.99466 | 0.99466 | 0.99466 | — |
+| FileEER | 0.15274 | 0.13838 | **0.11814** | **-14.6%** |
+| VoiceEER | **0.03006** | **0.03006** | **0.03006** | — |
+| MusicEER | 0.36851 | **0.22777** | **0.22777** | — |
+| Wall (144) | 407s | 408s | 409s | +0.2% |
+| VRAM peak | 5.20G | 6.25G | 6.25G | — |
+| Extrap 1200 (GTX) | 56.5 min | 56.7 min | 56.8 min | <60 min |
+| Extrap 1200 (L4 22.4G) | ~32 min | ~33 min | ~33 min | <60 min |
 
-**v2 validated on same validation split** (`split=validation`, n_file=144, n_voice=68, n_music=57). Previous `0.8072`/`0.2981` were stale max-aggregation numbers — superseded by q90 measurement.
+**H1 `file=max(df_raw, vp*df_voice, mp*music)` validated 409s/144** — suppresses `VOICE_FAKE 0.862` on music-only (HTDemucs hallucination). H3 `median→q90` regressed to `Score 0.84482 MusicEER 0.298`, H1+H2 `avg` to `0.85393` — not shipped. **v2 validated on same split** (`split=validation`, n_file=144, n_voice=68, n_music=57).
 
 ---
 
