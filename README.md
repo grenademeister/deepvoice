@@ -347,8 +347,19 @@ deepvoice/
 
 Available variant branches:
 
-- `baseline`: root-level baseline submission.
-- `v1`: root-level SONICS-enhanced submission.
+- `baseline`: validated DF-Arena baseline (`score=0.8384`).
+- `v1`: root-level SONICS experiment.
+- `v2`: ArtifactNet v9.4 on both raw audio and the native-rate HTDemucs music stem.
+
+The v2 validation result on 144 held-out files is:
+
+| Metric | Baseline | v2 |
+|---|---:|---:|
+| Score | 0.8384 | **0.8703** |
+| FileEER | 0.1671 | **0.1384** |
+| VoiceEER | 0.0301 | **0.0301** |
+| MusicEER | 0.2981 | **0.2278** |
+| CPS | 0.9947 | **0.9947** |
 
 Switching branches changes the submission files at the repository root without requiring nested-folder path logic.
 

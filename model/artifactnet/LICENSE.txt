@@ -1,0 +1,11 @@
+ArtifactNet v9.4 ONNX inference build
+Copyright: Intrect / ArtifactNet authors
+License declared upstream: Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
+License URL: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+Source model card: https://huggingface.co/intrect/artifactnet
+Pinned revision: 7c9b753a9d006b48e4bfaf85bf0157e135f4aad4
+
+IMPORTANT PATENT NOTICE
+The upstream model card states that bounded-mask residual extraction and codec-invariant training methods are covered by pending KR and PCT patent applications. It further states that the CC BY-NC 4.0 license does not grant a patent license and that commercial deployment requires separate copyright and patent licenses.
+
+This file records the upstream terms and is not legal advice. The complete controlling license text is available at the License URL above.

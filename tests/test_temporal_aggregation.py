@@ -30,8 +30,3 @@ def test_empty_input_uses_zero_default():
 def test_df_arena_uses_temporal_quantile():
     source = (ROOT / "script.py").read_text()
     assert "return aggregate_temporal_scores(segment_scores)" in source
-
-
-def test_sonics_uses_temporal_quantile():
-    source = (ROOT / "model" / "sonics_infer.py").read_text()
-    assert "return aggregate_temporal_scores(scores, default=0.0)" in source

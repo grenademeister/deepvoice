@@ -1,12 +1,25 @@
-Shared models
-- DF-Arena 1B, HTDemucs, and PANNs are stored in the repository-level
-  model/ directory during local development.
-- Copy those directories into this model/ directory when assembling a
-  standalone v1 submission.
+DeepVoice v2 model inventory
 
-SONICS SpecTTTra-alpha (v1 addition)
-- Purpose: AI-generated MUSIC detection (replaces DF-Arena for MUSIC_FAKE_PROB)
-- Source: awsaf49/sonics-spectttra-alpha-5s (ICLR 2025)
-- Local directory: sonics (config.json + pytorch_model.bin, 67 MiB)
-- Local inference module: sonics_infer.py (self-contained, torch/torchaudio only)
-- Model: SpecTTTra-a, 5s clips, 16 kHz, 17M params, single-class logit
+DF-Arena 1B
+- Purpose: voice-fake detection and raw/file fake evidence.
+- Local directory: df_arena_1b/
+- Input: 16 kHz mono, 64,600-sample segments.
+
+HTDemucs
+- Purpose: vocal/music source separation.
+- Local directory: htdemucs/
+- The native 44.1 kHz music stem is preserved for ArtifactNet.
+
+PANNs Cnn14
+- Purpose: voice/music component-presence probabilities.
+- Local directory: panns/
+
+ArtifactNet v9.4
+- Purpose: AI-generated music detection.
+- Source: https://huggingface.co/intrect/artifactnet
+- Pinned revision: 7c9b753a9d006b48e4bfaf85bf0157e135f4aad4
+- Local directory: artifactnet/
+- Runtime: ONNX Runtime GPU, with CUDA preferred and CPU fallback.
+- Input: 44.1 kHz mono, four-second chunks; track score is the median chunk probability.
+- v2 runs ArtifactNet independently on raw audio and the HTDemucs music stem.
+- License: CC BY-NC 4.0; see artifactnet/LICENSE.txt and the upstream patent notice.
