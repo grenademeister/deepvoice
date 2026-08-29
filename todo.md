@@ -160,7 +160,19 @@ Remaining release gates are clean-environment dependency installation, cold-star
 
 ### Mixed-audio coverage and sample inference
 
-The evalset contains 56 files with both `VOICE_PRESENT=1` and `MUSIC_PRESENT=1`: 40 `derived:voice_music_mix` files and 16 DeepVoice stress-suite files. All 56 belong to stress splits; none are in the 144-file validation split. The published H1 score therefore does **not** measure mixed voice+music performance. v2 is zero-shot and does not train on these files; they are used only for stress evaluation.
+The evalset originally contained 56 files with both `VOICE_PRESENT=1` and `MUSIC_PRESENT=1`: 40 `derived:voice_music_mix` files and 16 DeepVoice stress-suite files. All 56 belonged to stress splits; none were in the 144-file validation split. The published H1 score therefore did **not** measure mixed voice+music performance. v2 is zero-shot and does not train on these files; they are used only for stress evaluation.
+
+**2026-08-29 rebuild — balanced benchmark (val/test first):**
+Generated 197 additional `voice_music_mix` (10s, voice 1.0 + music 0.35, shortest) with source-diverse sampling across speech (asvspoof/modern_tts/wavefake) and music (gtzan/sonics/fakemusiccaps) pools to satisfy the structurally correct target: voice-only <20%, music-only <20%, music+voice >60% with equal quadrants `RV+RM / RV+FM / FV+RM / FV+FM`.
+
+New pool: mixed 253 (68/66/59/60 per quadrant), voice_only 773, music_only 505.
+
+Balanced splits (`manifests/manifest_balanced.csv`, `split_balanced`):
+- **validation: 150** — voice_only 25 (16.7%), music_only 25 (16.7%), **mixed 100 (66.7%) — 25 per quadrant**, group-disjoint
+- **test: 149** — voice_only 25 (16.8%), music_only 25 (16.8%), **mixed 99 (66.4%) — 25/25/24/25**, group-disjoint (1 short in FV+RM due to sibling-group blocking, within tolerance)
+- train: 698, stress: 17, unused_group_sibling: 761 (shift siblings blocked to prevent leakage)
+
+Original `manifest.csv` retains hash-based splits (validation 184, test 311) for backward comparison. Promotion must now use `split_balanced`.
 
 A fresh v2 H1 inference run on redistributable FakeMusicCaps sample `fakemusiccaps_MusicGen_medium_44bc8bbaa7b1cca8` produced:
 
