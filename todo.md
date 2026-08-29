@@ -156,6 +156,17 @@ A fresh v2 H1 inference run on redistributable FakeMusicCaps sample `fakemusicca
 
 The file and music decisions are correct for this MusicGen sample. The high `VOICE_FAKE` value occurs on a near-absent vocal stem and demonstrates HTDemucs/DF-Arena leakage. H1 suppresses it to `VOICE_PRESENT × VOICE_FAKE = 0.02096714`. Music contributes `MUSIC_PRESENT × MUSIC_FAKE = 0.92539609`; the final `FILE_FAKE = 0.94114014` is driven by DF-Arena on raw audio.
 
+### H1 hard-error audit
+
+A fresh complete H1 run reproduced the promoted metrics exactly and persisted `analysis_outputs/h1/h1_predictions.csv`, `h1_metrics.json`, and `hard_samples_scores.json`. The principal error modes are:
+
+1. **Unseen/newer music generators are ranked below real-music false positives.** Stable Audio Open sample `fakemusiccaps_stable_audio_open_77a9f35afd4432e8` has `MUSIC_FAKE=0.57217`; raw ArtifactNet gives 0.57217 and the HTDemucs music stem only 0.07653. Udio sample `sonics_03_89a7ac826d2cb25e` has `MUSIC_FAKE=0.76725`; the music-stem score collapses to `1.25e-6`.
+2. **Bona fide production/transform artifacts look synthetic.** DeepVoice stress-suite real music has mean `MUSIC_FAKE=0.98914` after transformations, while GTZAN real music has mean 0.53214 and maximum 0.96873. These high real scores force the validation Music-EER operating threshold to 0.99664 and create `MusicEER=0.22778`.
+3. **Some unseen speech generators evade DF-Arena.** WaveFake WF7 sample `wavefake_6eefebe983b32ef5` has `df_raw=0.30989`, `df_voice=0.40165`, and final `FILE_FAKE=0.32795` despite being fake. Presence is correct (`VOICE_PRESENT=0.81650`), so this is a detector-generalization failure rather than a presence-gating failure.
+4. **Stem evidence can be anti-informative.** For both hard music false negatives, ArtifactNet's stem score is much lower than its raw score. HTDemucs can erase or transform the forensic residuals that ArtifactNet needs; `max(raw, stem)` prevents a worse result but does not solve the missing representation.
+
+The severe real-music false positives are non-redistributable and are documented numerically rather than exported. The attached qualitative examples use redistributable hard false negatives.
+
 ---
 
 ## Step 6: v3 bottleneck audit

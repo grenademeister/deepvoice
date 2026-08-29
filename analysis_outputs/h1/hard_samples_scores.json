@@ -1,0 +1,44 @@
+[
+  {
+    "artifact_raw": 0.5721679329872131,
+    "artifact_stem": 0.07652813196182251,
+    "df_raw": 0.9359699368476868,
+    "df_voice": 0.94639892578125,
+    "file_fake": 0.9359699368476868,
+    "music_contribution": 0.5078433346278288,
+    "music_fake": 0.5721679329872131,
+    "music_present": 0.8875774145126343,
+    "name": "music_fn_stableaudio",
+    "sample_id": "fakemusiccaps_stable_audio_open_77a9f35afd4432e8",
+    "voice_contribution": 0.02965671476681564,
+    "voice_present": 0.031336378306150436
+  },
+  {
+    "artifact_raw": 0.7672504484653473,
+    "artifact_stem": 1.2516975402832031e-06,
+    "df_raw": 0.9927089095115662,
+    "df_voice": 0.9814756274223327,
+    "file_fake": 0.9927089095115662,
+    "music_contribution": 0.6690822072665963,
+    "music_fake": 0.7672504484653473,
+    "music_present": 0.8720518946647644,
+    "name": "music_fn_udio",
+    "sample_id": "sonics_03_89a7ac826d2cb25e",
+    "voice_contribution": 0.30126681321691,
+    "voice_present": 0.30695292353630066
+  },
+  {
+    "artifact_raw": 0.0013149380683898926,
+    "artifact_stem": 0.00023931264877319336,
+    "df_raw": 0.3098927140235901,
+    "df_voice": 0.40165072679519653,
+    "file_fake": 0.32794808502688966,
+    "music_contribution": 6.968841029664219e-05,
+    "music_fake": 0.0013149380683898926,
+    "music_present": 0.05299748480319977,
+    "name": "file_voice_fn_wf7",
+    "sample_id": "wavefake_6eefebe983b32ef5",
+    "voice_contribution": 0.32794808502688966,
+    "voice_present": 0.8165006637573242
+  }
+]
