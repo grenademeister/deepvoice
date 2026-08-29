@@ -1,6 +1,22 @@
 # DeepVoice Improvement Plan
 
-**Current best validated score:** 0.87939 (`v2` H1)
+**Current best validated score:** 0.87939 (`v2` H1, local 144-file validation)
+
+**Current best official submission score:** 0.6984253545 (`DV_v2_q90.zip`, submitted 2026-08-28 23:15:44)
+
+The local and official scores are not interchangeable. Actual submission history:
+
+| Submission | Submitted | Official score |
+|---|---|---:|
+| `DV_v2_q90.zip` | 2026-08-28 23:15:44 | **0.6984253545** |
+| `DV_v2_maxpool.zip` | 2026-08-28 22:54:35 | 0.6957896402 |
+| `DV_v2_q90_rawfile.zip` | 2026-08-28 23:29:07 | 0.6939253545 |
+| `DV_v1_betterpooling.zip` | 2026-08-27 19:47:27 | 0.6922539259 |
+| `DV_v1_baseline.zip` | 2026-08-27 17:54:26 | 0.6900110688 |
+
+Official evidence reverses the local aggregation conclusion: q90 improves over max pooling in both submitted generations (`+0.0022428571` for v1 better-pooling over baseline; `+0.0026357143` for v2 q90 over maxpool). Treat q90 as the deployment-favored temporal aggregator unless a stronger official or source-held-out test overturns it.
+
+`DV_v2_q90_rawfile.zip` differs from `DV_v2_q90.zip` by assigning `FILE_FAKE_PROB = raw_fake` instead of the H1 fused file score; ArtifactNet raw/stem music inference remains unchanged. Its exact `-0.0045` official-score regression therefore implies a `+0.01` FileEER regression if all other official metric components are identical. This does not contradict the ArtifactNet raw-versus-music-stem result: direct raw **DF-Arena file scoring** is worse than fused file scoring, while raw **ArtifactNet music scoring** is better than stem scoring.
 
 **Target:** Breakthrough v3 with robust cross-generator generalization
 
