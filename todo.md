@@ -165,6 +165,20 @@ A fresh complete H1 run reproduced the promoted metrics exactly and persisted `a
 3. **Some unseen speech generators evade DF-Arena.** WaveFake WF7 sample `wavefake_6eefebe983b32ef5` has `df_raw=0.30989`, `df_voice=0.40165`, and final `FILE_FAKE=0.32795` despite being fake. Presence is correct (`VOICE_PRESENT=0.81650`), so this is a detector-generalization failure rather than a presence-gating failure.
 4. **Stem evidence can be anti-informative.** For both hard music false negatives, ArtifactNet's stem score is much lower than its raw score. HTDemucs can erase or transform the forensic residuals that ArtifactNet needs; `max(raw, stem)` prevents a worse result but does not solve the missing representation.
 
+#### Music-only raw-versus-stem counterfactual
+
+The separator-shift hypothesis was tested on all 57 validation files with music present and voice absent (30 fake, 27 real), holding ArtifactNet weights and median aggregation fixed:
+
+| ArtifactNet input | ROC-AUC | EER |
+|---|---:|---:|
+| Original audio only | **0.78272** | **0.22778** |
+| HTDemucs music stem only | 0.63889 | 0.33333 |
+| `max(original, stem)` | 0.78025 | **0.22778** |
+
+HTDemucs induces a large distribution shift. The stem score decreased for all 30 fake files, with mean `stem - raw = -0.63815` and median `-0.81189`; at threshold 0.5, original audio correctly detects all 30 fake files, while stem-only detects only 9. The shift also lowers many real scores (26/27), so it sometimes removes real-audio false positives: at threshold 0.5, stem-only correctly rejects 20/27 real files versus 11/27 for raw. It is therefore not a simple global calibration shift; separation destroys class-discriminative evidence and compresses both classes toward low scores.
+
+Conclusion: the user's hypothesis is confirmed as a major failure of the stem path, but not as the sole cause of H1's MusicEER. Original-only ArtifactNet already gives the same `0.22778` EER as current max fusion because raw real/fake score distributions overlap. `max(raw, stem)` protects against most stem damage and does not improve EER; it slightly lowers ROC-AUC because one real telephone-transformed sample has a higher stem score. Persisted artifacts: `analysis_outputs/h1/music_only_raw_stem.csv` and `music_only_raw_stem_summary.json`.
+
 The severe real-music false positives are non-redistributable and are documented numerically rather than exported. The attached qualitative examples use redistributable hard false negatives.
 
 ---

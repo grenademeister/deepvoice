@@ -1,0 +1,46 @@
+{
+  "scope": {
+    "split": "validation",
+    "music_present": 1,
+    "voice_present": 0,
+    "n": 57,
+    "n_fake": 30,
+    "n_real": 27
+  },
+  "raw": {
+    "roc_auc": 0.782716049382716,
+    "eer": 0.22777777777777777,
+    "eer_threshold": 0.9966365098953247,
+    "mean_real": 0.5497431114867881,
+    "mean_fake": 0.9699884076913198
+  },
+  "stem": {
+    "roc_auc": 0.6388888888888888,
+    "eer": 0.3333333333333333,
+    "eer_threshold": 0.020949125289916992,
+    "mean_real": 0.26975318789482117,
+    "mean_fake": 0.3318395435810089
+  },
+  "max_raw_stem": {
+    "roc_auc": 0.7802469135802469,
+    "eer": 0.22777777777777777,
+    "eer_threshold": 0.9966365098953247
+  },
+  "stem_minus_raw": {
+    "real_mean": -0.279989923591967,
+    "real_median": -0.0031727254390716553,
+    "real_stem_lower_count": 26,
+    "real_stem_higher_count": 1,
+    "fake_mean": -0.6381488641103109,
+    "fake_median": -0.8118910044431686,
+    "fake_stem_lower_count": 30,
+    "fake_stem_higher_count": 0
+  },
+  "threshold_0_5_cross_tab": {
+    "both_correct": {"n": 20, "fake": 9, "real": 11},
+    "raw_correct_stem_wrong": {"n": 21, "fake": 21, "real": 0},
+    "raw_wrong_stem_correct": {"n": 9, "fake": 0, "real": 9},
+    "both_wrong": {"n": 7, "fake": 0, "real": 7}
+  },
+  "conclusion": "HTDemucs causes a strong score/domain shift and makes ArtifactNet substantially worse as a standalone music-fake detector. Original-audio inference is better, but raw-only EER remains 0.22778; separation is not the sole bottleneck. The max fusion preserves raw evidence and matches raw EER, while slightly reducing ROC-AUC because one real telephone-transformed sample receives a higher stem score."
+}
