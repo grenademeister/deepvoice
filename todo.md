@@ -78,6 +78,84 @@ ArtifactNet v9.4 runs independently on raw 44.1 kHz audio and the native-rate HT
 
 **Release qualification:** incomplete. The existing `deepvoice_v2_with_artifactnet.zip` contains ArtifactNet but excludes the DF-Arena, HTDemucs, and PANNs weights. Those weights exist locally, but a complete weight-inclusive archive still requires clean-environment installation, cold-start inference, checksum verification, L4 timing, and confirmation that ArtifactNet's CC BY-NC 4.0 terms are acceptable for the competition.
 
+### v2 full archive generated
+
+**Status:** Package generated and structurally verified locally.
+
+- Artifact: `deepvoice_v2_full.zip`
+- Archive size: 4,584,258,514 bytes
+- Extracted member size: 5,020,634,529 bytes
+- SHA-256: `cd6f01c0b3531569ad9fc8b1cd40a485babfe44a60f6604b1cf45e7a99f6bee7`
+- Top-level roots: exactly `model/`, `script.py`, and `requirements.txt`
+- Required weights included: DF-Arena 1B, HTDemucs, PANNs Cnn14, and ArtifactNet v9.4 ONNX plus external data
+- ArtifactNet checksum manifest: passed
+- ZIP CRC verification: passed
+- Python syntax compilation of the packaged script and local model modules: passed
+- Full `pytest` execution: blocked in the current system environment because `pytest` is not installed
+
+Remaining release gates are clean-environment dependency installation, cold-start inference, L4 timing, and ArtifactNet license review.
+
+### ArtifactNet q90 variant
+
+**Status:** Generated as a replacement archive on the requested q90 aggregation.
+
+- Artifact: `DV_v2_q90.zip`
+- ArtifactNet chunk aggregation changed from median to `np.quantile(probabilities, 0.90)`.
+- Archive size: 4,584,258,522 bytes
+- Extracted member size: 5,020,634,534 bytes
+- SHA-256: `5e61c09ee4ac66fc7fffde8f0ca31528a3fa879fa48e40df3e1af10249d1262b`
+- ZIP structure, required weights, CRC verification, ArtifactNet checksums, and Python syntax compilation: passed
+- This is an unvalidated experimental aggregation variant; the previously recorded v2 H1 score used ArtifactNet median aggregation.
+
+### Direct raw-audio file-score variant
+
+**Status:** Generated as an unvalidated comparison archive.
+
+- Artifact: `DV_v2_q90_rawfile.zip`
+- `FILE_FAKE_PROB` is directly assigned from q90 DF-Arena on the pre-separation raw 16 kHz audio (`raw_fake`).
+- Voice and music probabilities remain computed by the existing separated-stem pipeline; ArtifactNet remains q90 over chunks and max across raw/stem views.
+- Archive size: 4,584,258,556 bytes
+- Extracted member size: 5,020,634,604 bytes
+- SHA-256: `9ebaaa230dd88ce6c8001bb78227a75a72bf045da4142565626fe6cf3749d681`
+- Archive structure, required weights, CRC verification, ArtifactNet checksums, and Python syntax compilation: passed
+- This variant corresponds to the earlier raw-audio DF-Arena file-evidence experiment; it has not been re-evaluated on the validation split.
+
+#### Raw-file q90 validation result
+
+**Status:** Evaluated on the fixed validation split; not promoted.
+
+- Evaluation environment: GTX 1080 remote server, CUDA inference
+- Validation size: 144 files (`n_voice=68`, `n_music=57`)
+- Components phase: approximately 393 seconds
+- Score: **0.844821**
+- ADS: **0.828172**
+- CPS: **0.994662**
+- FileEER: **0.152742**
+- VoiceEER: **0.030062**
+- MusicEER: **0.298148**
+- Voice AUC: **0.990132**
+- Music AUC: **0.999193**
+- Compared with validated v2 H1 (`Score 0.87939`, `FileEER 0.11814`): score **-0.034569**, FileEER **+0.034602**.
+- Conclusion: directly assigning raw pre-separation DF-Arena q90 to `FILE_FAKE_PROB` regresses substantially versus H1 fusion, so this variant is not promoted.
+- Prediction artifact: `analysis_outputs/rawfile_q90/predictions.csv`
+- Metric artifact: `analysis_outputs/rawfile_q90/metrics.json`
+
+### Mixed-audio coverage and sample inference
+
+The evalset contains 56 files with both `VOICE_PRESENT=1` and `MUSIC_PRESENT=1`: 40 `derived:voice_music_mix` files and 16 DeepVoice stress-suite files. All 56 belong to stress splits; none are in the 144-file validation split. The published H1 score therefore does **not** measure mixed voice+music performance. v2 is zero-shot and does not train on these files; they are used only for stress evaluation.
+
+A fresh v2 H1 inference run on redistributable FakeMusicCaps sample `fakemusiccaps_MusicGen_medium_44bc8bbaa7b1cca8` produced:
+
+| Output | Probability |
+|---|---:|
+| FILE_FAKE | 0.9411401391 |
+| VOICE_FAKE | 0.8720627785 |
+| MUSIC_FAKE | 0.9999839067 |
+| VOICE_PRESENT | 0.0240431540 |
+| MUSIC_PRESENT | 0.9254109859 |
+
+The file and music decisions are correct for this MusicGen sample. The high `VOICE_FAKE` value occurs on a near-absent vocal stem and demonstrates HTDemucs/DF-Arena leakage. H1 suppresses it to `VOICE_PRESENT × VOICE_FAKE = 0.02096714`. Music contributes `MUSIC_PRESENT × MUSIC_FAKE = 0.92539609`; the final `FILE_FAKE = 0.94114014` is driven by DF-Arena on raw audio.
+
 ---
 
 ## Step 6: v3 bottleneck audit
