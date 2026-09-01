@@ -1,0 +1,2 @@
+a923b53899fbb01fcf4436cc5e1837628516de6044c9f238b31b4b02ed601a19  artifactnet_v94_full.onnx
+d3f291b4f531e22e5c17dff8b3888050033d301c7b7f3cb24bf4741cdaabbc05  artifactnet_v94_full.onnx.data

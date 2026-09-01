@@ -2,8 +2,9 @@
 
 Project: **DACON 236749 AI Deepvoice Detection Challenge**  
 Deadline: **September 29, 2026**  
-Current Score (baseline, 144 validation): **0.8072**  
-Primary bottleneck: **MusicEER = 0.2981** (10× worse than VoiceEER = 0.030)
+Primary zero-shot benchmark: `manifest_balanced.csv`, `split_balanced=validation/test`
+Locked full-pipeline max baseline: validation Score **0.73085**, test Score **0.70723**
+Primary bottleneck: **mixed MusicEER = 0.4241 / 0.3870** (validation/test)
 
 ---
 
@@ -40,7 +41,7 @@ deepvoice/
 
 **GPU server:** `ssh -p 30266 root@147.46.92.88` — GTX 1080 8GB, CUDA 12.4  
 **Server workdir:** `~/deepvoice/`, venv: `.venv311/bin/python3`  
-**Evalset:** `~/deepvoice-evalset/` (1578 files, 22 sources, 4.78h)
+**Evalset:** `~/deepvoice-evalset/` contains `manifests/manifest_balanced.csv`; use `split_balanced`, not legacy `split`, for all benchmark results. The group-disjoint benchmark partitions are train 698, validation 150, test 149; validation/test are 66.7% mixed voice+music with balanced authenticity quadrants.
 
 ---
 
@@ -59,16 +60,21 @@ Raw audio → [PANNs] → presence (voice, music)
 
 ---
 
-## 3. Current performance (144 validation files)
+## 3. Locked zero-shot benchmark (balanced protocol)
 
-| Metric | Value |
-|---|---|
-| **Score** | **0.8072** |
-| ADS | 0.7864 |
-| CPS | 0.9947 (near perfect) |
-| FileEER | 0.2363 |
-| VoiceEER | **0.0301** ← near ceiling |
-| MusicEER | **0.2981** ← main bottleneck |
+**Mandatory protocol:** Run the full deployed pipeline on `manifest_balanced.csv`, selecting `split_balanced=validation` only for hypotheses and evaluating `split_balanced=test` once after locking a choice. Never report the legacy `split=validation` result as a primary benchmark.
+
+| Metric | Validation (150) | Test (149) |
+|---|---:|---:|
+| **Score** | **0.73085** | **0.70723** |
+| ADS | 0.70250 | 0.67722 |
+| CPS | 0.98592 | 0.97726 |
+| FileEER | 0.30537 | 0.35530 |
+| FileEER, mixed only | 0.32667 | 0.40270 |
+| VoiceEER | 0.08798 | 0.14516 |
+| MusicEER | 0.42405 | 0.38698 |
+
+These figures are the reproducibility-verified no-scale `max(artifact_raw, artifact_stem)` baseline. The selected val-oriented submission fusion is stem-only (`music_fake = artifact_stem`); see `eval_results_balanced/final_ablation.txt` for the locked val/test trade-off.
 
 ---
 
@@ -194,3 +200,10 @@ submit.zip
 - PanNS expects 32kHz audio. `script.py` resamples before inference.
 - The evalset manifest uses **comma** delimiter (not pipe despite historical notes saying otherwise).
 - Empty fields in manifest (e.g., `expected_music_fake` for speech-only files) must be parsed as 0.0, not empty string.
+
+## V3 experiment discipline
+
+- Treat V3 SONICS/fusion adaptations as experimental until evaluated through the full `manifest_balanced.csv` / `split_balanced` pipeline.
+- The synthetic adaptation corpus is source-parent-disjoint and balanced: 12,000 mixtures, 20% music-only, 20% voice-only, 60% mixed with equal real/fake quadrants in every split.
+- V3 freezes DF-Arena 1B and PANNs. Do not promote a checkpoint from synthetic component EER alone; the deployed FileEER and total score are the release gates.
+- Current raw-mixture SONICS one-epoch result is rejected for promotion: target validation Score declines 0.80084→0.79573 despite a held-out test Score increase 0.73210→0.74506.

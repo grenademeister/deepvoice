@@ -28,8 +28,14 @@ from demucs.pretrained import get_model
 from demucs.separate import load_track
 from tqdm import tqdm
 
-# v1: 로컬 SONICS 추론 모듈 (awsaf49/sonics-spectttra-alpha-5s).
+# v2: ArtifactNet v9.4 on both raw audio and the HTDemucs music stem.
+from artifactnet_infer import (
+    ARTIFACTNET_SAMPLE_RATE,
+    load_artifactnet_model,
+    predict_artifactnet_raw_and_stem,
+)
 from temporal_aggregation import aggregate_temporal_scores
+from v2_fusion import fuse_v2_scores
 
 
 # 경로 설정
@@ -41,7 +47,7 @@ MODEL_DIR = SHARED_MODEL_DIR if SHARED_MODEL_DIR.is_dir() else LOCAL_MODEL_DIR
 DF_ARENA_DIR = MODEL_DIR / "df_arena_1b"
 HTDEMUCS_DIR = MODEL_DIR / "htdemucs"
 PANNS_DIR = MODEL_DIR / "panns"
-SONICS_DIR = LOCAL_MODEL_DIR / "sonics"
+ARTIFACTNET_DIR = MODEL_DIR / "artifactnet"
 
 DEFAULT_TEST_DIR = Path("data") / "test"
 DEFAULT_SAMPLE_SUBMISSION = Path("data") / "sample_submission.csv"
@@ -154,9 +160,9 @@ def order_audio_files(audio_files, submission_rows):
     return [audio_by_id[audio_id] for audio_id in submission_ids]
 
 
-def load_audio(audio_path):
+def load_audio(audio_path, sample_rate=AUDIO_SAMPLE_RATE):
     audio, _ = librosa.load(
-        audio_path, sr=AUDIO_SAMPLE_RATE, mono=True, dtype=np.float32
+        audio_path, sr=sample_rate, mono=True, dtype=np.float32
     )
     if audio.size == 0 or not np.isfinite(audio).all():
         raise ValueError(f"Invalid audio: {audio_path}")
@@ -284,8 +290,10 @@ def separate_voice_and_music(audio_path, model, device):
 
     if float(std) < 1e-8:
         length = round(waveform.shape[-1] * AUDIO_SAMPLE_RATE / model.samplerate)
+        native_length = waveform.shape[-1]
         silence = np.zeros(max(1, length), dtype=np.float32)
-        return silence, silence.copy()
+        native_silence = np.zeros(max(1, native_length), dtype=np.float32)
+        return silence, silence.copy(), native_silence
 
     normalized_waveform = (waveform - mean) / std
     with torch.inference_mode():
@@ -308,6 +316,7 @@ def separate_voice_and_music(audio_path, model, device):
         if source_name != "vocals":
             music_sources.append(sources[index])
     music_audio = torch.stack(music_sources).sum(0).mean(0, keepdim=True)
+    music_audio_native = music_audio[0].cpu().numpy().astype(np.float32)
 
     voice_audio = torchaudio.functional.resample(
         voice_audio, model.samplerate, AUDIO_SAMPLE_RATE
@@ -318,13 +327,14 @@ def separate_voice_and_music(audio_path, model, device):
     return (
         voice_audio.cpu().numpy().astype(np.float32),
         music_audio.cpu().numpy().astype(np.float32),
+        music_audio_native,
     )
 
 
 # -----------------------------------------------------------------------------
-# 5. DF-Arena 1B 를 이용한 성분별 Fake 추론
-#    - 음성 성분: DF-Arena 1B (기존 베이스라인 유지)
-#    - 음악 성분: SONICS SpecTTTra (v1 의 주요 변경) - 기존 DF-Arena 대체
+# 5. Component fake inference
+#    - voice: DF-Arena 1B on the HTDemucs vocal stem
+#    - music: ArtifactNet v9.4 on raw audio and the native-rate music stem
 # -----------------------------------------------------------------------------
 
 def load_df_arena_model(device):
@@ -373,44 +383,48 @@ def predict_fake(model, fake_label_index, audio, device):
 # 6. 파일 단위 점수 계산 및 제출 파일 저장
 # -----------------------------------------------------------------------------
 
-def combine_file_fake_score(voice_fake, music_fake, voice_present, music_present):
-    """Use max of component fake scores — ignores presence which hurts calibration."""
-    return max(voice_fake, music_fake)
-
-
 def predict_fake_scores_for_all_files(
     audio_files, submission_rows, presence_scores, device
 ):
     df_arena_model, fake_label_index = load_df_arena_model(device)
     htdemucs_model = load_htdemucs_model()
-    sonics_model = None  # DF-Arena replaces SONICS for music
+    artifactnet_session = load_artifactnet_model(ARTIFACTNET_DIR)
 
     for index, audio_path in enumerate(tqdm(audio_files, desc="Components")):
-        voice_stem, music_stem = separate_voice_and_music(
+        voice_stem, _music_stem_16k, music_stem_native = separate_voice_and_music(
             audio_path, htdemucs_model, device
         )
         voice_fake = predict_fake(
             df_arena_model, fake_label_index, voice_stem, device
         )
-        music_fake = predict_fake(
-            df_arena_model, fake_label_index, music_stem, device
-        )
-        if calculate_rms(music_stem) < SILENCE_RMS:
-            music_fake = 0.0
-
         voice_present, music_present = presence_scores[audio_path.stem]
 
-        # FILE_FAKE: DF-Arena on raw audio (decoupled from music)
-        audio = load_audio(audio_path)
+        raw_audio_16k = load_audio(audio_path)
         raw_fake = predict_fake(
-            df_arena_model, fake_label_index, audio, device
+            df_arena_model, fake_label_index, raw_audio_16k, device
         )
-        file_fake = max(raw_fake, voice_fake)
+
+        raw_audio_44k = load_audio(audio_path, ARTIFACTNET_SAMPLE_RATE)
+        artifact_raw, artifact_stem = predict_artifactnet_raw_and_stem(
+            artifactnet_session,
+            raw_audio=raw_audio_44k,
+            raw_sample_rate=ARTIFACTNET_SAMPLE_RATE,
+            music_stem=music_stem_native,
+            stem_sample_rate=htdemucs_model.samplerate,
+        )
+        fused = fuse_v2_scores(
+            df_raw=raw_fake,
+            df_voice=voice_fake,
+            artifact_raw=artifact_raw,
+            artifact_stem=artifact_stem,
+            music_present=music_present,
+            voice_present=voice_present,
+        )
 
         row = submission_rows[index]
-        row["FILE_FAKE_PROB"] = round(file_fake, 10)
+        row["FILE_FAKE_PROB"] = round(fused.file_fake, 10)
         row["VOICE_FAKE_PROB"] = round(voice_fake, 10)
-        row["MUSIC_FAKE_PROB"] = round(music_fake, 10)
+        row["MUSIC_FAKE_PROB"] = round(fused.music_fake, 10)
         row["VOICE_PRESENT_PROB"] = round(voice_present, 10)
         row["MUSIC_PRESENT_PROB"] = round(music_present, 10)
 

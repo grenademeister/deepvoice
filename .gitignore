@@ -12,3 +12,9 @@ __pycache__/
 *.pt
 *.onnx
 *.zip
+# Remote development and experiment outputs.
+.venv311/
+runs/
+eval_results/
+eval_results_balanced/
+*.onnx.data
