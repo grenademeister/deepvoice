@@ -108,7 +108,10 @@ def build_index(args):
                 names = [n for n in z.namelist() if n.lower().endswith(('.wav','.flac','.mp3'))]
             entries = [('zip://' + str(root) + '::' + n, Path(n).stem.rsplit('_generated',1)[0]) for n in names]
         else:
-            entries = [(str(p), p.stem.rsplit('_',1)[0]) for p in Path(root).rglob('*') if p.suffix.lower() in {'.wav','.flac','.mp3'}]
+            def group(path):
+                stem = path.stem
+                return stem.rsplit('_', 2)[0] if modality == 'music' and stem.count('_') >= 2 else stem.rsplit('_', 1)[0]
+            entries = [(str(p), group(p)) for p in Path(root).rglob('*') if p.suffix.lower() in {'.wav','.flac','.mp3'}]
         indexed[modality].extend({'path': p, 'label': label, 'group': g, 'split': partition(g)} for p,g in entries)
     for modality, entries in indexed.items():
         path = out / f'{modality}.csv'
