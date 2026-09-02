@@ -1,465 +1,186 @@
 #!/usr/bin/env python3
-"""경진대회 테스트 데이터에 대한 5개 확률값을 생성한다."""
-
+"""Online-mixing V4: frozen experts, trainable SONICS head and fusion MLP."""
 import argparse
 import csv
+import hashlib
+import io
 import json
-import os
-import shutil
-import sys
+import random
+import zipfile
 from pathlib import Path
 
-# 추론에는 model 폴더에 포함된 로컬 파일만 사용한다.
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-sys.dont_write_bytecode = True
-
-# v1 전용 로컬 추론 모듈(SONICS)을 import 할 수 있도록 경로를 추가한다.
-LOCAL_MODEL_DIR = Path(__file__).resolve().parent / "model"
-if str(LOCAL_MODEL_DIR) not in sys.path:
-    sys.path.insert(0, str(LOCAL_MODEL_DIR))
-
-import librosa
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
-from demucs.apply import apply_model
-from demucs.pretrained import get_model
-from demucs.separate import load_track
-from tqdm import tqdm
-
-# v2: ArtifactNet v9.4 on both raw audio and the HTDemucs music stem.
-from artifactnet_infer import (
-    ARTIFACTNET_SAMPLE_RATE,
-    load_artifactnet_model,
-    predict_artifactnet_raw_and_stem,
-)
-from temporal_aggregation import aggregate_temporal_scores
-from v2_fusion import fuse_v2_scores
-
-
-# 경로 설정
-BASE_DIR = Path(__file__).resolve().parent
-# 로컬 개발에서는 모델 버전들이 루트 model/ 가중치를 공유한다.
-# 단독 제출 패키지에서는 script.py 옆의 model/ 구조도 지원한다.
-SHARED_MODEL_DIR = BASE_DIR.parent / "model"
-MODEL_DIR = SHARED_MODEL_DIR if SHARED_MODEL_DIR.is_dir() else LOCAL_MODEL_DIR
-DF_ARENA_DIR = MODEL_DIR / "df_arena_1b"
-HTDEMUCS_DIR = MODEL_DIR / "htdemucs"
-PANNS_DIR = MODEL_DIR / "panns"
-ARTIFACTNET_DIR = MODEL_DIR / "artifactnet"
-
-DEFAULT_TEST_DIR = Path("data") / "test"
-DEFAULT_SAMPLE_SUBMISSION = Path("data") / "sample_submission.csv"
-DEFAULT_OUTPUT_PATH = Path("output") / "submission.csv"
-
-# 오디오 처리 설정
-AUDIO_SAMPLE_RATE = 16_000
-PANNS_SAMPLE_RATE = 32_000
-SEGMENT_SAMPLES = 64_600
-SILENCE_RMS = 1e-5
-PRESENCE_THRESHOLD = 0.3  # minimum presence to consider a component present
-
-PREDICTION_COLUMNS = [
-    "FILE_FAKE_PROB",
-    "VOICE_FAKE_PROB",
-    "MUSIC_FAKE_PROB",
-    "VOICE_PRESENT_PROB",
-    "MUSIC_PRESENT_PROB",
-]
-
-SUPPORTED_AUDIO_EXTENSIONS = {
-    ".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"
-}
-
-
-# -----------------------------------------------------------------------------
-# 1. 입력 파일 및 제출 양식 확인
-# -----------------------------------------------------------------------------
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Run the zero-shot audio deepfake baseline."
-    )
-    parser.add_argument("--test-dir", type=Path, default=DEFAULT_TEST_DIR)
-    parser.add_argument(
-        "--sample-submission", type=Path, default=DEFAULT_SAMPLE_SUBMISSION
-    )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
-    parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    return parser.parse_args()
-
-
-def select_device(device_name):
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available")
-    return torch.device(device_name)
-
-
-def find_audio_files(test_dir):
-    if not test_dir.is_dir():
-        raise FileNotFoundError(f"Test directory not found: {test_dir}")
-
-    audio_files = []
-    for path in test_dir.iterdir():
-        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
-            audio_files.append(path)
-    audio_files.sort(key=lambda path: path.stem)
-
-    if not audio_files:
-        raise FileNotFoundError(f"No audio files found in {test_dir}")
-
-    audio_ids = [path.stem for path in audio_files]
-    if len(audio_ids) != len(set(audio_ids)):
-        raise ValueError("Audio IDs must be unique")
-    return audio_files
-
-
-def read_sample_submission(csv_path):
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Sample submission not found: {csv_path}")
-
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        column_names = reader.fieldnames
-        rows = list(reader)
-
-    if column_names is None or not rows:
-        raise ValueError(f"Invalid sample submission: {csv_path}")
-
-    required_columns = ["ID"] + PREDICTION_COLUMNS
-    missing_columns = [name for name in required_columns if name not in column_names]
-    if missing_columns:
-        raise ValueError(f"Sample submission is missing columns: {missing_columns}")
-
-    seen_ids = set()
-    for row in rows:
-        audio_id = str(row["ID"]).strip()
-        if not audio_id:
-            raise ValueError("Sample submission contains an empty ID")
-        if audio_id in seen_ids:
-            raise ValueError(f"Duplicate ID in sample submission: {audio_id}")
-        seen_ids.add(audio_id)
-        row["ID"] = audio_id
-
-    return column_names, rows
-
-
-def order_audio_files(audio_files, submission_rows):
-    audio_by_id = {path.stem: path for path in audio_files}
-    submission_ids = [row["ID"] for row in submission_rows]
-
-    missing_ids = [audio_id for audio_id in submission_ids if audio_id not in audio_by_id]
-    extra_ids = [audio_id for audio_id in audio_by_id if audio_id not in submission_ids]
-    if missing_ids or extra_ids:
-        raise ValueError(
-            "Test audio and sample submission IDs do not match. "
-            f"Missing: {missing_ids[:5]}, Extra: {extra_ids[:5]}"
-        )
-
-    return [audio_by_id[audio_id] for audio_id in submission_ids]
-
-
-def load_audio(audio_path, sample_rate=AUDIO_SAMPLE_RATE):
-    audio, _ = librosa.load(
-        audio_path, sr=sample_rate, mono=True, dtype=np.float32
-    )
-    if audio.size == 0 or not np.isfinite(audio).all():
-        raise ValueError(f"Invalid audio: {audio_path}")
-    return audio
-
-
-# -----------------------------------------------------------------------------
-# 2. 오디오 구간 분할
-# -----------------------------------------------------------------------------
-
-def get_segment_starts(audio_length):
-    if audio_length <= SEGMENT_SAMPLES:
-        return [0]
-
-    last_start = audio_length - SEGMENT_SAMPLES
-    starts = list(range(0, last_start + 1, SEGMENT_SAMPLES))
-    if starts[-1] != last_start:
-        starts.append(last_start)
-    return starts
-
-
-def extract_segment(audio, start):
-    if audio.size < SEGMENT_SAMPLES:
-        repeat_count = SEGMENT_SAMPLES // audio.size + 1
-        audio = np.tile(audio, repeat_count)
-        return audio[:SEGMENT_SAMPLES].astype(np.float32)
-
-    end = start + SEGMENT_SAMPLES
-    return audio[start:end].astype(np.float32, copy=False)
-
-
-# -----------------------------------------------------------------------------
-# 3. PANNs를 이용한 음성·음악 존재 여부 추론
-# -----------------------------------------------------------------------------
-
-def prepare_panns_labels():
-    source = PANNS_DIR / "class_labels_indices.csv"
-    target = Path.home() / "panns_data" / "class_labels_indices.csv"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-
-
-def load_panns_model(device):
-    prepare_panns_labels()
-    from panns_inference import AudioTagging, labels
-
-    model = AudioTagging(
-        checkpoint_path=str(PANNS_DIR / "Cnn14_mAP=0.431.pth"),
-        device=device.type,
-    )
-
-    config_path = PANNS_DIR / "component_labels.json"
-    label_groups = json.loads(config_path.read_text(encoding="utf-8"))
-    label_to_index = {label: index for index, label in enumerate(labels)}
-    voice_indices = [label_to_index[label] for label in label_groups["voice"]]
-    music_indices = [label_to_index[label] for label in label_groups["music"]]
-    return model, voice_indices, music_indices
-
-
-def make_panns_segments(audio):
-    segments = []
-    for start in get_segment_starts(audio.size):
-        segment = extract_segment(audio, start)
-        segment = librosa.resample(
-            segment,
-            orig_sr=AUDIO_SAMPLE_RATE,
-            target_sr=PANNS_SAMPLE_RATE,
-            res_type="soxr_hq",
-        )
-        segments.append(segment.astype(np.float32))
-    return np.stack(segments)
-
-
-def predict_presence(model, voice_indices, music_indices, audio):
-    segments = make_panns_segments(audio)
-    predictions, _ = model.inference(segments)
-    voice_probability = float(predictions[:, voice_indices].max())
-    music_probability = float(predictions[:, music_indices].max())
-    return voice_probability, music_probability
-
-
-def predict_presence_for_all_files(audio_files, device):
-    model, voice_indices, music_indices = load_panns_model(device)
-    presence_scores = {}
-
-    for audio_path in tqdm(audio_files, desc="Presence"):
-        audio = load_audio(audio_path)
-        presence_scores[audio_path.stem] = predict_presence(
-            model, voice_indices, music_indices, audio
-        )
-
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return presence_scores
-
-
-# -----------------------------------------------------------------------------
-# 4. HTDemucs를 이용한 음성·음악 분리
-# -----------------------------------------------------------------------------
-
-def load_htdemucs_model():
-    original_torch_load = torch.load
-
-    def load_trusted_checkpoint(*args, **kwargs):
-        # PyTorch 2.6부터 바뀐 기본값에 맞춰 기존 체크포인트를 불러온다.
-        kwargs.setdefault("weights_only", False)
-        return original_torch_load(*args, **kwargs)
-
-    torch.load = load_trusted_checkpoint
-    try:
-        model = get_model("htdemucs", repo=HTDEMUCS_DIR)
-    finally:
-        torch.load = original_torch_load
-    return model.cpu().eval()
-
-
-def separate_voice_and_music(audio_path, model, device):
-    waveform = load_track(
-        audio_path, model.audio_channels, model.samplerate
-    ).float()
-    mono_waveform = waveform.mean(0)
-    mean = mono_waveform.mean()
-    std = mono_waveform.std()
-
-    if float(std) < 1e-8:
-        length = round(waveform.shape[-1] * AUDIO_SAMPLE_RATE / model.samplerate)
-        native_length = waveform.shape[-1]
-        silence = np.zeros(max(1, length), dtype=np.float32)
-        native_silence = np.zeros(max(1, native_length), dtype=np.float32)
-        return silence, silence.copy(), native_silence
-
-    normalized_waveform = (waveform - mean) / std
-    with torch.inference_mode():
-        sources = apply_model(
-            model,
-            normalized_waveform[None],
-            device=device,
-            shifts=0,
-            split=True,
-            overlap=0.25,
-            progress=False,
-        )[0]
-    sources = sources * std + mean
-
-    vocal_index = model.sources.index("vocals")
-    voice_audio = sources[vocal_index].mean(0, keepdim=True)
-
-    music_sources = []
-    for index, source_name in enumerate(model.sources):
-        if source_name != "vocals":
-            music_sources.append(sources[index])
-    music_audio = torch.stack(music_sources).sum(0).mean(0, keepdim=True)
-    music_audio_native = music_audio[0].cpu().numpy().astype(np.float32)
-
-    voice_audio = torchaudio.functional.resample(
-        voice_audio, model.samplerate, AUDIO_SAMPLE_RATE
-    )[0]
-    music_audio = torchaudio.functional.resample(
-        music_audio, model.samplerate, AUDIO_SAMPLE_RATE
-    )[0]
-    return (
-        voice_audio.cpu().numpy().astype(np.float32),
-        music_audio.cpu().numpy().astype(np.float32),
-        music_audio_native,
-    )
-
-
-# -----------------------------------------------------------------------------
-# 5. Component fake inference
-#    - voice: DF-Arena 1B on the HTDemucs vocal stem
-#    - music: ArtifactNet v9.4 on raw audio and the native-rate music stem
-# -----------------------------------------------------------------------------
-
-def load_df_arena_model(device):
-    if str(MODEL_DIR) not in sys.path:
-        sys.path.insert(0, str(MODEL_DIR))
-    from df_arena_1b.modeling_antispoofing import DF_Arena_1B_Antispoofing
-
-    previous_directory = Path.cwd()
-    os.chdir(DF_ARENA_DIR)
-    try:
-        model = DF_Arena_1B_Antispoofing.from_pretrained(
-            str(DF_ARENA_DIR),
-            local_files_only=True,
-            low_cpu_mem_usage=True,
-        )
-    finally:
-        os.chdir(previous_directory)
-
-    model = model.to(device).eval()
-    fake_label_index = int(model.config.label2id["spoof"])
-    return model, fake_label_index
-
-
-def calculate_rms(audio):
-    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
-
-
-def predict_fake(model, fake_label_index, audio, device):
-    if calculate_rms(audio) < SILENCE_RMS:
-        return 0.0
-
-    segment_scores = []
-    for start in get_segment_starts(audio.size):
-        segment = extract_segment(audio, start)
-        segment_tensor = torch.from_numpy(segment).to(device)
-
-        with torch.inference_mode():
-            logits = model(input_values=segment_tensor)["logits"]
-            probabilities = torch.softmax(logits.float(), dim=-1)
-        segment_scores.append(float(probabilities[0, fake_label_index]))
-
-    return aggregate_temporal_scores(segment_scores)
-
-
-# -----------------------------------------------------------------------------
-# 6. 파일 단위 점수 계산 및 제출 파일 저장
-# -----------------------------------------------------------------------------
-
-def predict_fake_scores_for_all_files(
-    audio_files, submission_rows, presence_scores, device
-):
-    df_arena_model, fake_label_index = load_df_arena_model(device)
-    htdemucs_model = load_htdemucs_model()
-    artifactnet_session = load_artifactnet_model(ARTIFACTNET_DIR)
-
-    for index, audio_path in enumerate(tqdm(audio_files, desc="Components")):
-        voice_stem, _music_stem_16k, music_stem_native = separate_voice_and_music(
-            audio_path, htdemucs_model, device
-        )
-        voice_fake = predict_fake(
-            df_arena_model, fake_label_index, voice_stem, device
-        )
-        voice_present, music_present = presence_scores[audio_path.stem]
-
-        raw_audio_16k = load_audio(audio_path)
-        raw_fake = predict_fake(
-            df_arena_model, fake_label_index, raw_audio_16k, device
-        )
-
-        raw_audio_44k = load_audio(audio_path, ARTIFACTNET_SAMPLE_RATE)
-        artifact_raw, artifact_stem = predict_artifactnet_raw_and_stem(
-            artifactnet_session,
-            raw_audio=raw_audio_44k,
-            raw_sample_rate=ARTIFACTNET_SAMPLE_RATE,
-            music_stem=music_stem_native,
-            stem_sample_rate=htdemucs_model.samplerate,
-        )
-        fused = fuse_v2_scores(
-            df_raw=raw_fake,
-            df_voice=voice_fake,
-            artifact_raw=artifact_raw,
-            artifact_stem=artifact_stem,
-            music_present=music_present,
-            voice_present=voice_present,
-        )
-
-        row = submission_rows[index]
-        row["FILE_FAKE_PROB"] = round(fused.file_fake, 10)
-        row["VOICE_FAKE_PROB"] = round(voice_fake, 10)
-        row["MUSIC_FAKE_PROB"] = round(fused.music_fake, 10)
-        row["VOICE_PRESENT_PROB"] = round(voice_present, 10)
-        row["MUSIC_PRESENT_PROB"] = round(music_present, 10)
-
-    return submission_rows
-
-
-def save_submission(output_path, column_names, rows):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=column_names)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def main():
-    args = parse_arguments()
-    device = select_device(args.device)
-
-    # 1. 테스트 파일을 제출 양식의 ID 순서에 맞춘다.
-    audio_files = find_audio_files(args.test_dir)
-    column_names, submission_rows = read_sample_submission(args.sample_submission)
-    audio_files = order_audio_files(audio_files, submission_rows)
-
-    # 2. 파일별 음성·음악 존재 확률을 계산한다.
-    presence_scores = predict_presence_for_all_files(audio_files, device)
-
-    # 3. 음성과 음악을 분리한 뒤 성분별 Fake 확률을 계산한다.
-    submission_rows = predict_fake_scores_for_all_files(
-        audio_files, submission_rows, presence_scores, device
-    )
-
-    # 4. 5개 예측값을 제출 파일로 저장한다.
-    save_submission(args.output, column_names, submission_rows)
-    print(f"Saved {len(submission_rows)} predictions to {args.output}")
-
-
-if __name__ == "__main__":
-    main()
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from models import artifactnet, dfarena, panns, separator, sonics
+from models.fusion import Fusion
+
+SR, SECONDS = 16000, 10
+N = SR * SECONDS
+SIX = ('df_voice', 'sonics_stem', 'artifact_raw', 'artifact_stem', 'voice_present', 'music_present')
+
+
+def stable(*parts):
+    return int(hashlib.sha256('|'.join(map(str, parts)).encode()).hexdigest()[:16], 16)
+
+
+def partition(group):
+    value = stable(group) % 10
+    return 'train' if value < 8 else 'validation' if value == 8 else 'test'
+
+
+def audio(ref):
+    if ref.startswith('zip://'):
+        archive, member = ref[6:].split('::', 1)
+        with zipfile.ZipFile(archive) as z:
+            x, rate = sf.read(io.BytesIO(z.read(member)), dtype='float32')
+    else:
+        x, rate = sf.read(ref, dtype='float32')
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 2:
+        x = x.mean(1)
+    if rate != SR:
+        x = torchaudio.functional.resample(torch.from_numpy(x), rate, SR).numpy()
+    if not np.isfinite(x).all() or not len(x):
+        raise ValueError(f'invalid audio: {ref}')
+    return x
+
+
+def crop(x, key):
+    if len(x) < N:
+        return np.pad(x, (0, N - len(x)), mode='wrap')
+    offset = stable(key) % (len(x) - N + 1)
+    return x[offset:offset + N]
+
+
+def rows(path, split):
+    with Path(path).open() as f:
+        return [r for r in csv.DictReader(f) if r['split'] == split]
+
+
+class OnlineMixtureDataset(Dataset):
+    # One 20-item cycle: 20% music-only, 20% voice-only, 60% equal mixed quadrants.
+    kinds = [(0,1,0,0),(0,1,0,1),(0,1,0,0),(0,1,0,1),
+             (1,0,0,0),(1,0,1,0),(1,0,0,0),(1,0,1,0),
+             *[(1,1,v,m) for v in (0,1) for m in (0,1) for _ in range(3)]]
+
+    def __init__(self, voice_csv, music_csv, split, size, seed=0):
+        self.voice = rows(voice_csv, split)
+        self.music = rows(music_csv, split)
+        self.size, self.seed, self.epoch = size, seed, 0
+        self.pools = {
+            'voice': {label: [r for r in self.voice if int(r['label']) == label] for label in (0,1)},
+            'music': {label: [r for r in self.music if int(r['label']) == label] for label in (0,1)},
+        }
+        if any(not values for modality in self.pools.values() for values in modality.values()):
+            raise ValueError('each split needs both real and fake sources for voice and music')
+
+    def set_epoch(self, epoch): self.epoch = epoch
+    def __len__(self): return self.size
+    def choose(self, modality, label, index):
+        pool = self.pools[modality][label]
+        return pool[stable(self.seed, self.epoch, modality, label, index) % len(pool)]
+
+    def __getitem__(self, index):
+        vp, mp, vf, mf = self.kinds[index % len(self.kinds)]
+        key = (self.seed, self.epoch, index)
+        v = crop(audio(self.choose('voice', vf, index)['path']), (*key, 'voice')) if vp else np.zeros(N, np.float32)
+        m = crop(audio(self.choose('music', mf, index)['path']), (*key, 'music')) if mp else np.zeros(N, np.float32)
+        if vp and mp:
+            m *= .2 + (stable(*key, 'gain') % 401) / 1000
+        x = v + m
+        x /= max(float(np.abs(x).max()), 1.0)
+        return torch.from_numpy(x), torch.tensor([vp, mp, vf, mf, int(vf or mf)], dtype=torch.float32)
+
+
+def build_index(args):
+    specs = [('voice', args.voice_real, 0, False), ('voice', args.voice_fake, 1, True),
+             ('music', args.music_real, 0, False), ('music', args.music_fake, 1, False)]
+    out = Path(args.source_dir); out.mkdir(parents=True, exist_ok=True)
+    indexed = {'voice': [], 'music': []}
+    for modality, root, label, archive in specs:
+        if archive:
+            with zipfile.ZipFile(root) as z:
+                names = [n for n in z.namelist() if n.lower().endswith(('.wav','.flac','.mp3'))]
+            entries = [('zip://' + str(root) + '::' + n, Path(n).stem.rsplit('_generated',1)[0]) for n in names]
+        else:
+            entries = [(str(p), p.stem.rsplit('_',1)[0]) for p in Path(root).rglob('*') if p.suffix.lower() in {'.wav','.flac','.mp3'}]
+        indexed[modality].extend({'path': p, 'label': label, 'group': g, 'split': partition(g)} for p,g in entries)
+    for modality, entries in indexed.items():
+        path = out / f'{modality}.csv'
+        with path.open('w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=('path','label','group','split')); writer.writeheader(); writer.writerows(entries)
+        print(json.dumps({'manifest': str(path), 'rows': len(entries)}))
+
+
+def experts(root, device, train_sonics):
+    root = Path(root)
+    return (separator.load(root/'htdemucs', device), dfarena.load(root/'df_arena_1b', device),
+            sonics.load(root/'sonics', device, train_sonics), artifactnet.load(root/'artifactnet'),
+            panns.load(root/'panns', device))
+
+
+def feature_batch(mix, net, device):
+    sep, df, music_net, artifact, presence_net = net
+    vocals, music = separator.separate(sep, mix.to(device))
+    df_score = [dfarena.score(*df, x.detach().cpu().numpy(), device) for x in vocals]
+    raw, stem, voice, present_music = [], [], [], []
+    pmodel, vi, mi = presence_net
+    for x, m in zip(mix, music):
+        x, m = x.numpy(), m.detach().cpu().numpy()
+        a, b = panns.score(pmodel, vi, mi, x); voice.append(a); present_music.append(b)
+        raw.append(artifactnet.score(artifact, x, SR)); stem.append(artifactnet.score(artifact, m, SR))
+    sonics_logit = sonics.logits(music_net, music)
+    fixed = torch.tensor(np.stack([df_score, raw, stem, voice, present_music], 1), device=device).float().clamp(1e-5, 1-1e-5)
+    return torch.cat((torch.logit(fixed[:, :1]), sonics_logit[:, None], torch.logit(fixed[:, 1:])), 1)
+
+
+def loss(logits, labels):
+    vp, mp, vf, mf, ff = labels.T
+    bce = nn.BCEWithLogitsLoss(reduction='none')
+    value = bce(logits[:,0], ff).mean()
+    value += (bce(logits[:,1], vf) * vp).sum() / vp.sum().clamp_min(1)
+    value += (bce(logits[:,2], mf) * mp).sum() / mp.sum().clamp_min(1)
+    return value
+
+
+def run_epoch(loader, net, fusion, optimizer, device):
+    total = 0.0
+    for step, (mix, labels) in enumerate(loader, 1):
+        scores = feature_batch(mix, net, device); value = loss(fusion(scores), labels.to(device))
+        if optimizer:
+            optimizer.zero_grad(); value.backward(); optimizer.step()
+        total += value.item()
+        if optimizer and step % 20 == 0: print(json.dumps({'batch':step, 'loss':total/step}))
+    return total / max(1, len(loader))
+
+
+def train(args):
+    device = torch.device(args.device); train_set = OnlineMixtureDataset(args.voice_csv, args.music_csv, 'train', args.train_size, args.seed)
+    valid_set = OnlineMixtureDataset(args.voice_csv, args.music_csv, 'validation', args.valid_size, args.seed)
+    net = experts(args.models, device, True); fusion = Fusion().to(device)
+    optimizer = torch.optim.AdamW([*net[2].classifier.parameters(), *fusion.parameters()], lr=args.lr)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    valid_loader = DataLoader(valid_set, batch_size=args.batch_size, num_workers=0)
+    history=[]
+    for epoch in range(args.epochs):
+        train_set.set_epoch(epoch); tr=run_epoch(train_loader, net, fusion, optimizer, device)
+        with torch.no_grad(): va=run_epoch(valid_loader, net, fusion, None, device)
+        history.append({'epoch':epoch, 'train_loss':tr, 'validation_loss':va}); print(json.dumps(history[-1]))
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({'sonics_head':net[2].classifier.state_dict(), 'fusion':fusion.state_dict(), 'features':SIX, 'history':history}, args.output)
+
+
+def arguments():
+    p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='command', required=True)
+    i=sub.add_parser('index'); i.add_argument('--source-dir', required=True); i.add_argument('--voice-real', required=True); i.add_argument('--voice-fake', required=True); i.add_argument('--music-real', required=True); i.add_argument('--music-fake', required=True)
+    t=sub.add_parser('train'); t.add_argument('--voice-csv', required=True); t.add_argument('--music-csv', required=True); t.add_argument('--models', default='model'); t.add_argument('--output', required=True); t.add_argument('--epochs', type=int, default=1); t.add_argument('--train-size', type=int, default=20000); t.add_argument('--valid-size', type=int, default=2000); t.add_argument('--batch-size', type=int, default=1); t.add_argument('--lr', type=float, default=1e-4); t.add_argument('--seed', type=int, default=0); t.add_argument('--device', default='cuda')
+    return p.parse_args()
+
+
+if __name__ == '__main__':
+    args=arguments(); build_index(args) if args.command == 'index' else train(args)
