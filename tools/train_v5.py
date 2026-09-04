@@ -88,6 +88,8 @@ def main():
     a.run_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = a.run_dir / "sonics_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    stems_cache = a.run_dir / "stems_cache"
+    stems_cache.mkdir(parents=True, exist_ok=True)
     dev = torch.device(a.device)
 
     # --- frozen models ---
@@ -138,10 +140,23 @@ def main():
             # collect uncached sonics inputs for batched encoder
             need_raw, need_stem, need_ids = [], [], []
             pending = []
-            # Phase 1: HTDemucs + PANNs per-sample (collect), DF batched in micro-batches
+            # Phase 1: HTDemucs stem file cache + PANNs (epoch1 saves stems, epoch2+ loads)
             voices, accs, raw44s, vps, mps = [], [], [], [], []
             for r in batch:
-                voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
+                sid0 = r["sample_id"]
+                scp = stems_cache / f"{sid0}.npz"
+                if scp.exists():
+                    try:
+                        d = __import__("numpy").load(str(scp))
+                        voice, acc = d["voice"], d["acc"]
+                    except Exception:
+                        voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
+                        __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
+                        __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
+                else:
+                    voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
+                    __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
+                    __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
                 vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
                 voices.append(voice); accs.append(acc); vps.append(vp); mps.append(mp)
                 raw44s.append(load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE))
