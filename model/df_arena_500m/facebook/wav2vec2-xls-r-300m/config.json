@@ -1,41 +1,15 @@
 {
   "activation_dropout": 0.0,
   "apply_spec_augment": true,
-  "architectures": [
-    "Wav2Vec2ForPreTraining"
-  ],
+  "architectures": ["Wav2Vec2ForPreTraining"],
   "attention_dropout": 0.1,
   "bos_token_id": 1,
-  "codevector_dim": 1024,
+  "codevector_dim": 768,
   "contrastive_logits_temperature": 0.1,
   "conv_bias": true,
-  "conv_dim": [
-    512,
-    512,
-    512,
-    512,
-    512,
-    512,
-    512
-  ],
-  "conv_kernel": [
-    10,
-    3,
-    3,
-    3,
-    3,
-    2,
-    2
-  ],
-  "conv_stride": [
-    5,
-    2,
-    2,
-    2,
-    2,
-    2,
-    2
-  ],
+  "conv_dim": [512, 512, 512, 512, 512, 512, 512],
+  "conv_kernel": [10, 3, 3, 3, 3, 2, 2],
+  "conv_stride": [5, 2, 2, 2, 2, 2, 2],
   "ctc_loss_reduction": "sum",
   "ctc_zero_infinity": false,
   "diversity_loss_weight": 0.1,
@@ -50,9 +24,9 @@
   "gradient_checkpointing": false,
   "hidden_act": "gelu",
   "hidden_dropout": 0.1,
-  "hidden_size": 1280,
+  "hidden_size": 1024,
   "initializer_range": 0.02,
-  "intermediate_size": 5120,
+  "intermediate_size": 4096,
   "layer_norm_eps": 1e-05,
   "layerdrop": 0.1,
   "mask_feature_length": 10,
@@ -66,11 +40,11 @@
   "num_conv_pos_embedding_groups": 16,
   "num_conv_pos_embeddings": 128,
   "num_feat_extract_layers": 7,
-  "num_hidden_layers": 48,
+  "num_hidden_layers": 24,
   "num_negatives": 100,
   "pad_token_id": 0,
-  "proj_codevector_dim": 1024,
+  "proj_codevector_dim": 768,
   "torch_dtype": "float32",
-  "transformers_version": "4.12.0.dev0",
+  "transformers_version": "4.57.6",
   "use_weighted_layer_sum": false
 }

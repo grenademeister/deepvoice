@@ -1,6 +1,6 @@
 from transformers import PretrainedConfig
 
-class DF_Arena_1B_Config(PretrainedConfig):
+class DF_Arena_500M_Config(PretrainedConfig):
     model_type = "antispoofing"
     def __init__(self, num_labels=2, sample_rate=16000, **kwargs):
         super().__init__(**kwargs)

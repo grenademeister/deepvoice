@@ -19,9 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.transforms import AmplitudeToDB, MelSpectrogram
 
-from temporal_aggregation import aggregate_temporal_scores
-
-
 class MeanStdNorm(nn.Module):
     def forward(self, x):
         mean = x.mean((1, 2), keepdim=True)
@@ -252,26 +249,3 @@ def preprocess_window(audio, sample_rate, max_len):
         audio = np.pad(audio, (0, max_len - n), mode="constant")
     audio = audio / max(float(np.std(audio)), 1e-6)
     return audio.astype(np.float32)
-
-
-def predict_fake(model, audio, sample_rate, window_seconds=5.0, device=None):
-    """Run SONICS over windows and return a robust upper-quantile score."""
-    sample_rate = int(sample_rate)
-    max_len = int(window_seconds * sample_rate)
-    device = device or next(model.parameters()).device
-
-    starts = list(range(0, audio.shape[0], max_len))
-    if starts[-1] != max(0, audio.shape[0] - max_len):
-        starts.append(max(0, audio.shape[0] - max_len))
-    starts = sorted(set(starts))
-
-    scores = []
-    with torch.inference_mode():
-        for start in starts:
-            window = audio[start : start + max_len]
-            window = preprocess_window(window, sample_rate, max_len)
-            tensor = torch.from_numpy(window).unsqueeze(0).to(device)
-            logit = model(tensor)
-            prob = torch.sigmoid(logit.float())
-            scores.append(float(prob.reshape(-1)[0]))
-    return aggregate_temporal_scores(scores, default=0.0)

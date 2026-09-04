@@ -1,11 +1,9 @@
-Shared models
-- DF-Arena 1B, HTDemucs, and PANNs are stored in the repository-level
-  model/ directory during local development.
-- Copy those directories into this model/ directory when assembling a
-  standalone v1 submission.
+DeepVoice models
+- DF-Arena 500M, HTDemucs, PANNs, ArtifactNet, and SONICS live under model/.
+- Model weights are excluded from Git and must be present before training or inference.
 
-SONICS SpecTTTra-alpha (v1 addition)
-- Purpose: AI-generated MUSIC detection (replaces DF-Arena for MUSIC_FAKE_PROB)
+SONICS SpecTTTra-alpha
+- Purpose: AI-generated music detection and V5 embeddings
 - Source: awsaf49/sonics-spectttra-alpha-5s (ICLR 2025)
 - Local directory: sonics (config.json + pytorch_model.bin, 67 MiB)
 - Local inference module: sonics_infer.py (self-contained, torch/torchaudio only)

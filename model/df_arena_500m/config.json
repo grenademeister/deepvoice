@@ -1,5 +1,5 @@
 {
-  "architectures": ["DF-Arena-1B-V0.1"],
+  "architectures": ["DF-Arena-500M-V0.1"],
   "model_type": "antispoofing",
 
   "num_labels": 2,
@@ -13,8 +13,8 @@
   },
 
   "auto_map": {
-    "AutoConfig": "configuration_antispoofing.DF_Arena_1B_Config",
-    "AutoModel": "modeling_antispoofing.DF_Arena_1B_Antispoofing",
+    "AutoConfig": "configuration_antispoofing.DF_Arena_500M_Config",
+    "AutoModel": "modeling_antispoofing.DF_Arena_500M_Antispoofing",
     "AutoFeatureExtractor": "feature_extraction_antispoofing.AntispoofingFeatureExtractor"
   },
   "custom_pipelines": {

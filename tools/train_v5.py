@@ -1,390 +1,271 @@
 #!/usr/bin/env python3
-"""V5 batched trainer — implicit SONICS cache after epoch 1.
-
-Epoch 1: full forward (HTDemucs → DF500M / SONICS raw+stem / Artifact / PANNs) + backprop.
-         SONICS raw/stem embeddings are saved to sonics_cache per sample_id.
-Epoch 2+: SONICS encoder is skipped, cached embeddings are reused.
-
-Batched: DataLoader batch_size groups, SONICS encoder runs batched per group.
-No explicit feature files — cache is on disk, no RAM growth.
-"""
+"""Train or resume V5 fusion from prepared expensive features."""
 from __future__ import annotations
-import argparse, csv, json, sys
+
+import argparse
+import csv
+import json
+import os
+import random
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "model")]
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_curve, roc_auc_score
-from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score, roc_curve
 
-PROJECT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT))
-sys.path.insert(0, str(PROJECT / "model"))
-
-from model.v5_fusion import V5Fusion, V5Meta, payload, logit
+from model.v5_fusion import Fusion, logits, payload
+from tools.prepare_v5 import Cache, atomic_json, contract, read_manifest, release, samples
 
 
-def num(v):
-    return 0.0 if v in ("", None) else float(v)
+def number(value: str | None) -> float:
+    return 0.0 if value is None or str(value).strip() == "" else float(value)
 
 
-def eer(y, s):
-    fpr, tpr, _ = roc_curve(y, s, pos_label=1, drop_intermediate=False)
-    return float(((fpr + 1 - tpr) / 2)[np.argmin(np.abs(fpr - (1 - tpr)))])
+@dataclass(frozen=True)
+class Config:
+    epochs: int = 3
+    batch_size: int = 16
+    projection: int = 64
+    hidden: int = 128
+    learning_rate: float = 3e-4
+    seed: int = 20260904
 
 
-def metrics(rows, pf, pv, pm):
-    yf = np.array([num(r["expected_file_fake"]) for r in rows], float)
-    yv = np.array([num(r["expected_voice_fake"]) for r in rows], float)
-    ym = np.array([num(r["expected_music_fake"]) for r in rows], float)
-    yvp = np.array([num(r["expected_voice_present"]) for r in rows], float)
-    ymp = np.array([num(r["expected_music_present"]) for r in rows], float)
-    fe = eer(yf, np.array(pf, float))
-    vm = yvp > 0.5
-    mm = ymp > 0.5
-    ve = eer(yv[vm], np.array(pv)[vm]) if vm.sum() else 0.0
-    me = eer(ym[mm], np.array(pm)[mm]) if mm.sum() else 0.0
-    ads = 0.5 * (1 - fe) + 0.2 * (1 - ve) + 0.3 * (1 - me)
-    # CPS needs presence probs — caller passes those separately if needed
-    return {"file_eer": fe, "voice_eer": ve, "music_eer": me, "ads": ads}
+@dataclass
+class Dataset:
+    rows: list[dict[str, str]]
+    scalars: np.ndarray
+    raw: np.ndarray
+    stem: np.ndarray
+    labels: np.ndarray
+    masks: np.ndarray
+    presence: np.ndarray
+
+    def split(self, name: str):
+        indices = np.array([i for i, row in enumerate(self.rows) if row["split"] == name])
+        if not len(indices):
+            raise ValueError(f"No rows for split={name}")
+        return Dataset([self.rows[i] for i in indices], self.scalars[indices], self.raw[indices],
+                       self.stem[indices], self.labels[indices], self.masks[indices], self.presence[indices])
 
 
-class ManifestDS(Dataset):
-    def __init__(self, rows): self.rows = rows
-    def __len__(self): return len(self.rows)
-    def __getitem__(self, i): return self.rows[i]
+def event(path: Path, name: str, **fields):
+    record = {"event": name, "time": time.time(), **fields}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    print(json.dumps(record, sort_keys=True), flush=True)
 
 
-def sonics_embed_batched(model, wavs, dev):
-    """wavs: list[np] each (T,) at 16k. Returns np [B, D]. Batched encoder."""
-    from sonics_infer import preprocess_window
-    import torch
-    batch = np.stack([preprocess_window(w, 16000, 80000) for w in wavs])  # [B, 80000]
-    t = torch.from_numpy(batch).to(dev)
+def assemble(rows: list[dict[str, str]], cache: Cache, device: torch.device, events: Path) -> Dataset:
+    expensive = []
+    for row in rows:
+        if cache.stems(row["sample_id"], samples(row)) is None:
+            raise RuntimeError(f"Missing stems for {row['sample_id']}")
+        df, sonics = cache.df(row["sample_id"]), cache.sonics(row["sample_id"])
+        if df is None or sonics is None:
+            raise RuntimeError(f"Incomplete feature cache for {row['sample_id']}")
+        expensive.append((df, sonics))
+
+    from script import (ARTIFACTNET_SAMPLE_RATE, MODEL_DIR, load_artifactnet_model, load_audio,
+                        load_panns_model, predict_artifactnet_raw_and_stem, predict_presence)
+    event(events, "transient_start", stage="panns", total=len(rows))
+    model, voice_indices, music_indices = load_panns_model(device)
+    presence = []
+    try:
+        for i, row in enumerate(rows, 1):
+            presence.append(predict_presence(model, voice_indices, music_indices, load_audio(row["local_path"])))
+            if i % 100 == 0 or i == len(rows):
+                event(events, "transient_batch", stage="panns", done=i, total=len(rows))
+    finally:
+        release(model, device)
+    del model
+
+    event(events, "transient_start", stage="artifactnet", total=len(rows))
+    model = load_artifactnet_model(MODEL_DIR / "artifactnet")
+    artifacts = []
+    try:
+        for i, row in enumerate(rows, 1):
+            stem = cache.stems(row["sample_id"], samples(row))["acc"]
+            artifacts.append(predict_artifactnet_raw_and_stem(
+                model, raw_audio=load_audio(row["local_path"], ARTIFACTNET_SAMPLE_RATE),
+                raw_sample_rate=ARTIFACTNET_SAMPLE_RATE, music_stem=stem, stem_sample_rate=16000,
+            ))
+            if i % 100 == 0 or i == len(rows):
+                event(events, "transient_batch", stage="artifactnet", done=i, total=len(rows))
+    finally:
+        release(model, device)
+    del model
+
+    scalar_values, raw, stem, labels, masks = [], [], [], [], []
+    for row, (df, sonics), found_presence, artifact in zip(rows, expensive, presence, artifacts, strict=True):
+        scalar_values.append((df, *artifact, *found_presence))
+        raw.append(sonics["raw"]); stem.append(sonics["stem"])
+        labels.append((number(row["expected_file_fake"]), number(row["expected_voice_fake"]), number(row["expected_music_fake"])))
+        masks.append((1, number(row["expected_voice_present"]), number(row["expected_music_present"])))
+    return Dataset(rows, logits(np.asarray(scalar_values, np.float32)), np.asarray(raw, np.float32),
+                   np.asarray(stem, np.float32), np.asarray(labels, np.float32), np.asarray(masks, np.float32),
+                   np.asarray(presence, np.float32))
+
+
+def masked_loss(output, labels, masks):
+    losses = F.binary_cross_entropy_with_logits(output, labels, reduction="none")
+    return (losses * masks).sum() / masks.sum().clamp_min(1)
+
+
+def predict(model: Fusion, data: Dataset, batch_size: int, device: torch.device):
+    model.eval(); predictions, total_loss, count = [], 0.0, 0.0
     with torch.inference_mode():
-        spec = model.ft_extractor(t)
-        spec = spec.unsqueeze(1)
-        spec = F.interpolate(spec, size=model.input_shape, mode="bilinear")
-        feats = model.encoder(spec)  # [B, T, D]
-        emb = feats.mean(dim=1)
-    return emb.detach().cpu().numpy()
+        for start in range(0, len(data.rows), batch_size):
+            end = start + batch_size
+            tensors = [torch.from_numpy(value[start:end]).to(device) for value in (data.scalars, data.raw, data.stem, data.labels, data.masks)]
+            output = model(*tensors[:3]); weight = float(tensors[4].sum())
+            total_loss += float(masked_loss(output, tensors[3], tensors[4]).cpu()) * weight; count += weight
+            predictions.append(torch.sigmoid(output).cpu().numpy())
+    return np.concatenate(predictions), total_loss / count
+
+
+def eer(labels, scores):
+    if len(np.unique(labels)) < 2:
+        return float("nan")
+    fpr, tpr, _ = roc_curve(labels, scores, pos_label=1, drop_intermediate=False)
+    fnr = 1 - tpr; index = np.argmin(np.abs(fpr - fnr))
+    return float((fpr[index] + fnr[index]) / 2)
+
+
+def metrics(data: Dataset, predictions: np.ndarray):
+    present = np.array([[number(row["expected_voice_present"]), number(row["expected_music_present"])] for row in data.rows])
+    file_eer = eer(data.labels[:, 0], predictions[:, 0])
+    voice_eer = eer(data.labels[present[:, 0] > .5, 1], predictions[present[:, 0] > .5, 1])
+    music_eer = eer(data.labels[present[:, 1] > .5, 2], predictions[present[:, 1] > .5, 2])
+    aucs = [float(roc_auc_score(present[:, i], data.presence[:, i])) if len(np.unique(present[:, i])) > 1 else float("nan") for i in range(2)]
+    ads = .5 * (1 - file_eer) + .2 * (1 - voice_eer) + .3 * (1 - music_eer)
+    cps = sum(aucs) / 2
+    return {"file_eer": file_eer, "voice_eer": voice_eer, "music_eer": music_eer, "ads": ads,
+            "voice_auc": aucs[0], "music_auc": aucs[1], "cps": cps, "score": .9 * ads + .1 * cps}
+
+
+def atomic_save(value: object, path: Path):
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".tmp-", suffix=".pt", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        torch.save(value, temporary); os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def rng_state():
+    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+
+
+def restore_rng(state):
+    random.setstate(state["python"]); np.random.set_state(state["numpy"]); torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+
+
+def training_state(model, optimizer, scheduler, config, cache_contract, epoch, offset, step,
+                   history, best_score, loss_sum, loss_count):
+    return {
+        "format": "deepvoice-v5-training-state", "config": asdict(config), "cache_contract": cache_contract,
+        "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+        "epoch": epoch, "offset": offset, "step": step, "history": history, "best_score": best_score,
+        "loss_sum": loss_sum, "loss_count": loss_count, "rng": rng_state(),
+    }
+
+
+def write_predictions(path: Path, data: Dataset, predictions: np.ndarray):
+    fields = ("ID", "FILE_FAKE_PROB", "VOICE_FAKE_PROB", "MUSIC_FAKE_PROB", "VOICE_PRESENT_PROB", "MUSIC_PRESENT_PROB")
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle); writer.writerow(fields)
+        for row, scores, presence in zip(data.rows, predictions, data.presence, strict=True):
+            writer.writerow((row["sample_id"], *[f"{value:.10f}" for value in scores], *[f"{value:.10f}" for value in presence]))
+
+
+def train(train_data, validation, cache_contract, run_dir: Path, config: Config, device,
+          checkpoint_every: int, resume: bool, max_steps: int):
+    run_dir.mkdir(parents=True, exist_ok=True); events = run_dir / "events.jsonl"; last = run_dir / "last.pt"
+    random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
+    if device.type == "cuda": torch.cuda.manual_seed_all(config.seed)
+    model = Fusion(config.projection, config.hidden).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    epoch, offset, step, history, best_score, loss_sum, loss_count = 1, 0, 0, [], -float("inf"), 0.0, 0
+    if resume:
+        saved = torch.load(last, map_location=device, weights_only=False)
+        if saved.get("format") != "deepvoice-v5-training-state" or saved["config"] != asdict(config) or saved["cache_contract"] != cache_contract:
+            raise ValueError("Incompatible resume checkpoint")
+        model.load_state_dict(saved["model"]); optimizer.load_state_dict(saved["optimizer"]); scheduler.load_state_dict(saved["scheduler"])
+        epoch, offset, step, history = saved["epoch"], saved["offset"], saved["step"], saved["history"]
+        best_score = saved["best_score"]
+        loss_sum, loss_count = saved["loss_sum"], saved["loss_count"]; restore_rng(saved["rng"])
+        event(events, "resume", epoch=epoch, offset=offset, step=step)
+    elif last.exists():
+        raise FileExistsError("Run already exists; pass --resume or choose another --run-dir")
+
+    invocation_steps = 0
+    while epoch <= config.epochs:
+        order = np.random.default_rng(config.seed + epoch).permutation(len(train_data.rows)); model.train()
+        while offset < len(order):
+            indices = order[offset:offset + config.batch_size]
+            tensors = [torch.from_numpy(value[indices]).to(device) for value in (train_data.scalars, train_data.raw, train_data.stem, train_data.labels, train_data.masks)]
+            optimizer.zero_grad(set_to_none=True); loss = masked_loss(model(*tensors[:3]), tensors[3], tensors[4])
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1); optimizer.step()
+            loss_sum += float(loss.detach().cpu()); loss_count += 1; offset += len(indices); step += 1; invocation_steps += 1
+            save = step % checkpoint_every == 0 or (max_steps and invocation_steps >= max_steps)
+            if save:
+                atomic_save(training_state(model, optimizer, scheduler, config, cache_contract, epoch, offset, step,
+                                           history, best_score, loss_sum, loss_count), last)
+            if max_steps and invocation_steps >= max_steps:
+                event(events, "paused", epoch=epoch, offset=offset, step=step); return
+
+        predictions, validation_loss = predict(model, validation, config.batch_size, device)
+        record = {"epoch": epoch, "train_loss": loss_sum / loss_count, "validation_loss": validation_loss, **metrics(validation, predictions)}
+        history.append(record); write_predictions(run_dir / f"validation_{epoch:02d}.csv", validation, predictions)
+        atomic_json(run_dir / f"metrics_{epoch:02d}.json", record)
+        checkpoint = payload(model, {"config": asdict(config), "history": history})
+        atomic_save(checkpoint, run_dir / f"epoch_{epoch:02d}.pt")
+        if record["score"] > best_score:
+            best_score = record["score"]; atomic_save(checkpoint, run_dir / "best.pt")
+        scheduler.step(); epoch += 1; offset = 0; loss_sum = 0.; loss_count = 0
+        atomic_save(training_state(model, optimizer, scheduler, config, cache_contract, epoch, offset, step,
+                                   history, best_score, loss_sum, loss_count), last)
+        atomic_json(run_dir / "history.json", history); event(events, "epoch", **record, step=step)
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True); parser.add_argument("--train-split", default="train")
+    parser.add_argument("--validation-split", default="validation"); parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=16); parser.add_argument("--projection", type=int, default=64)
+    parser.add_argument("--hidden", type=int, default=128); parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=20260904); parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--resume", action="store_true"); parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", type=Path, required=True)
-    ap.add_argument("--run-dir", type=Path, required=True)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--log-every", type=int, default=1)
-    ap.add_argument("--proj-dim", type=int, default=64)
-    ap.add_argument("--hidden-dim", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--seed", type=int, default=20260904)
-    a = ap.parse_args()
-    torch.manual_seed(a.seed); np.random.seed(a.seed)
-    a.run_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = a.run_dir / "sonics_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    stems_cache = a.run_dir / "stems_cache"
-    stems_cache.mkdir(parents=True, exist_ok=True)
-    dev = torch.device(a.device)
-
-    # --- frozen models ---
-    from script import (load_audio, load_panns_model, predict_presence,
-                        load_htdemucs_model, separate_voice_and_music,
-                        load_artifactnet_model, predict_artifactnet_raw_and_stem,
-                        ARTIFACTNET_SAMPLE_RATE)
-    from sonics_infer import SonicsClassifier
-    import json as _json
-    # DF500M via HF cache offline
-    from huggingface_hub import snapshot_download
-    from transformers import AutoModel
-    snap = snapshot_download("Speech-Arena-2025/DF_Arena_500M_V_1", local_files_only=True)
-    df = AutoModel.from_pretrained(snap, trust_remote_code=True, local_files_only=True).to(dev).eval()
-    fake_idx = int(df.config.label2id["spoof"])
-    panns, vi, mi = load_panns_model(dev)
-    htd = load_htdemucs_model()
-    art = load_artifactnet_model(PROJECT / "model" / "artifactnet")
-    cfg = _json.loads((PROJECT / "model" / "sonics" / "config.json").read_text())
-    son = SonicsClassifier(cfg)
-    son.load_state_dict(torch.load(PROJECT / "model" / "sonics" / "pytorch_model.bin", map_location="cpu", weights_only=True))
-    son.to(dev).eval()
-    for p in son.parameters(): p.requires_grad_(False)
-    # --- manifest ---
-    rows_all = list(csv.DictReader(a.manifest.open()))
-    # manifest local_path may be relative to deepvoice root
-    for r in rows_all:
-        if not Path(r["local_path"]).is_absolute():
-            r["local_path"] = str(PROJECT / r["local_path"])
-    tr_rows = [r for r in rows_all if r["split"] == "train"]
-    va_rows = [r for r in rows_all if r["split"] == "validation"]
-    print(f"train {len(tr_rows)} val {len(va_rows)}", flush=True)
-
-    fusion = V5Fusion(proj_dim=a.proj_dim, hidden_dim=a.hidden_dim).to(dev)
-    opt = torch.optim.AdamW(fusion.parameters(), lr=a.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
-    history = []
-
-    def run_split(split_rows, train: bool):
-        # batched DataLoader over rows
-        ds = ManifestDS(split_rows)
-        dl = DataLoader(ds, batch_size=a.batch_size, shuffle=train, collate_fn=lambda x: x, num_workers=0)
-        all_pf, all_pv, all_pm, all_vp, all_mp = [], [], [], [], []
-        losses = []
-        for bi, batch in enumerate(dl):
-            # per-batch: run frozen branches
-            scalars, raw_embs, stem_embs, labels, masks = [], [], [], [], []
-            # collect uncached sonics inputs for batched encoder
-            need_raw, need_stem, need_ids = [], [], []
-            pending = []
-            # Phase 1: Batched HTDemucs with stem file cache (epoch1 computes batched, epoch2 loads)
-            voices, accs, raw44s, vps, mps = [], [], [], [], []
-            # split batch into cached stems vs need HTDemucs
-            need_hdemucs_idx = []
-            need_paths = []
-            for idx, r in enumerate(batch):
-                sid0 = r["sample_id"]
-                scp = stems_cache / f"{sid0}.npz"
-                if scp.exists():
-                    try:
-                        d = __import__("numpy").load(str(scp))
-                        voices.append(d["voice"]); accs.append(d["acc"])
-                        # placeholder for later PANNs/raw
-                        need_hdemucs_idx.append(None)
-                        continue
-                    except Exception:
-                        pass
-                # need compute
-                need_hdemucs_idx.append(idx)
-                need_paths.append(r["local_path"])
-                voices.append(None); accs.append(None)
-            # batched HTDemucs for uncached (single apply_model call)
-            if need_paths:
-                import torch as _thd
-                from script import load_track
-                import torchaudio
-                # load and normalize per-sample, pad to max
-                wavs = []
-                means, stds, lens = [], [], []
-                max_len = 0
-                for pth in need_paths:
-                    wf = load_track(pth, htd.audio_channels, htd.samplerate).float()  # [C, T]
-                    mono = wf.mean(0)
-                    mean = mono.mean(); std = mono.std()
-                    if float(std) < 1e-8:
-                        # silence: create zeros at target sr
-                        length = round(wf.shape[-1] * 16000 / htd.samplerate)
-                        wavs.append((__import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32), __import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32), mean, std, True))
-                        continue
-                    norm = (wf - mean) / std
-                    wavs.append((norm, mean, std, False))
-                    max_len = max(max_len, norm.shape[-1])
-                # pad and stack
-                batch_norm = []
-                valid_idx = []
-                for item in wavs:
-                    if len(item)==5: # silence case
-                        continue
-                    norm, mean, std, _ = item
-                    pad = max_len - norm.shape[-1]
-                    if pad>0:
-                        norm = _thd.nn.functional.pad(norm, (0, pad))
-                    batch_norm.append(norm)
-                    means.append(mean); stds.append(std)
-                if batch_norm:
-                    # micro-batched HTDemucs to avoid OOM: chunk B_need into 4
-                    vocal_idx = htd.sources.index("vocals")
-                    # need_hdemucs_idx filtered order == batch_norm order
-                    need_orig_indices = [i for i in need_hdemucs_idx if i is not None]
-                    micro_h = 2
-                    # iterate micro batches with local padding
-                    for micro_s in range(0, len(batch_norm), micro_h):
-                        micro_e = min(micro_s+micro_h, len(batch_norm))
-                        chunk_norm = batch_norm[micro_s:micro_e]
-                        chunk_means = means[micro_s:micro_e]
-                        chunk_stds = stds[micro_s:micro_e]
-                        chunk_orig = need_orig_indices[micro_s:micro_e]
-                        # local max for this micro batch
-                        local_max = max(x.shape[-1] for x in chunk_norm)
-                        # re-pad if needed (already padded to global max, but trim to local max to save VRAM)
-                        trimmed = []
-                        for x in chunk_norm:
-                            if x.shape[-1] > local_max:
-                                trimmed.append(x[:, :local_max])
-                            elif x.shape[-1] < local_max:
-                                trimmed.append(_thd.nn.functional.pad(x, (0, local_max - x.shape[-1])))
-                            else:
-                                trimmed.append(x)
-                        batch_tensor = _thd.stack(trimmed).to(dev)  # [micro, C, T]
-                        with _thd.inference_mode():
-                            from demucs.apply import apply_model as _apply
-                            sources = _apply(htd, batch_tensor, device=dev, shifts=0, split=True, overlap=0.25, progress=False)  # [micro, 4, C, T]
-                        for bj2, orig_idx in enumerate(chunk_orig):
-                            mean = chunk_means[bj2]; std = chunk_stds[bj2]
-                            src = sources[bj2] * std + mean  # [nsrc, C, T]
-                            voice_t = src[vocal_idx].mean(0, keepdim=True)
-                            music_sources = [src[i] for i, n in enumerate(htd.sources) if n != "vocals"]
-                            music_t = _thd.stack(music_sources).sum(0).mean(0, keepdim=True)
-                            voice = torchaudio.functional.resample(voice_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
-                            acc = torchaudio.functional.resample(music_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
-                            voices[orig_idx] = voice; accs[orig_idx] = acc
-                            sid0 = batch[orig_idx]["sample_id"]
-                            scp = stems_cache / f"{sid0}.npz"
-                            __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
-                            __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
-                        del batch_tensor, sources
-                        if dev.type=="cuda":
-                            _thd.cuda.empty_cache()
-                # handle silence cases (already zero)
-                for idx, r in enumerate(batch):
-                    if voices[idx] is None:
-                        # silence
-                        sid0 = r["sample_id"]
-                        scp = stems_cache / f"{sid0}.npz"
-                        # create zeros if not already
-                        if not scp.exists():
-                            wf = load_track(r["local_path"], htd.audio_channels, htd.samplerate).float()
-                            length = round(wf.shape[-1] * 16000 / htd.samplerate)
-                            voice = __import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32)
-                            acc = voice.copy()
-                            voices[idx]=voice; accs[idx]=acc
-                            __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
-                            __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
-                        else:
-                            d=__import__("numpy").load(str(scp))
-                            voices[idx]=d["voice"]; accs[idx]=d["acc"]
-            # PANNs/raw per-sample (cheap)
-            for r in batch:
-                vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
-                vps.append(vp); mps.append(mp)
-                raw44s.append(load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE))
-            # Chunked batched DF500M: [B,T] -> [B,2] with micro-batch to stay <8GB
-            df_probs = []
-            micro = 4  # 4*160k fits in 4GB headroom
-            with torch.inference_mode():
-                for i in range(0, len(voices), micro):
-                    chunk = voices[i:i+micro]
-                    max_len = max(v.shape[0] for v in chunk)
-                    batch_arr = np.stack([np.pad(v, (0, max_len - v.shape[0])) if v.shape[0] < max_len else v[:max_len] for v in chunk])
-                    wavs_t = torch.from_numpy(batch_arr).float().to(dev)
-                    out = df(input_values=wavs_t)
-                    logits_b = out["logits"] if isinstance(out, dict) else out.logits
-                    probs = torch.softmax(logits_b.float(), dim=-1)[:, fake_idx].detach().cpu().numpy()
-                    df_probs.extend(probs.tolist())
-            # Phase 2: assemble scalars
-            for idx, r in enumerate(batch):
-                dfp = float(df_probs[idx])
-                vp, mp = vps[idx], mps[idx]
-                acc = accs[idx]
-                raw44 = raw44s[idx]
-                ar, ast = predict_artifactnet_raw_and_stem(art, raw_audio=raw44, raw_sample_rate=ARTIFACTNET_SAMPLE_RATE, music_stem=acc, stem_sample_rate=16000)
-                sc = np.array([dfp, ar, ast, vp, mp], np.float32)
-                scalars.append(logit(sc))
-                labels.append([num(r["expected_file_fake"]), num(r["expected_voice_fake"]), num(r["expected_music_fake"])])
-                masks.append([1.0, num(r["expected_voice_present"]), num(r["expected_music_present"])])
-                all_vp.append(vp); all_mp.append(mp)
-                sid = r["sample_id"]
-                # SONICS file cache: epoch 1 saves, epoch 2+ reuses
-                cp = cache_dir / f"{sid}.npz"
-                if cp.exists():
-                    try:
-                        d = np.load(str(cp))
-                        er, es = d["raw"], d["stem"]
-                        raw_embs.append(er); stem_embs.append(es)
-                    except Exception:
-                        pending.append((sid, len(raw_embs), cp))
-                        raw_embs.append(None); stem_embs.append(None)
-                        need_raw.append(load_audio(r["local_path"]))
-                        need_stem.append(acc)
-                else:
-                    pending.append((sid, len(raw_embs), cp))
-                    raw_embs.append(None); stem_embs.append(None)
-                    need_raw.append(load_audio(r["local_path"]))
-                    need_stem.append(acc)
-            # batched SONICS for uncached (and save to disk immediately)
-            if need_raw:
-                er_batch = sonics_embed_batched(son, need_raw, dev)
-                es_batch = sonics_embed_batched(son, need_stem, dev)
-                for (sid, idx, cp), er, es in zip(pending, er_batch, es_batch):
-                    tmp = str(cp).replace(".npz", ".tmp.npz")
-                    np.savez_compressed(tmp, raw=er, stem=es)
-                    import os as _os
-                    _os.replace(tmp, str(cp))
-                    raw_embs[idx] = er
-                    stem_embs[idx] = es
-            # Fusion micro-batched bsz=4 -> accumulate 4 micros then 1 opt step per outer B=16
-            micro_f = 4
-            if train:
-                opt.zero_grad(set_to_none=True)
-                micro_losses=[]
-                for s in range(0, len(scalars), micro_f):
-                    e = min(s+micro_f, len(scalars))
-                    scalars_t = torch.from_numpy(np.stack(scalars[s:e])).to(dev)
-                    raw_t = torch.from_numpy(np.stack(raw_embs[s:e])).to(dev)
-                    stem_t = torch.from_numpy(np.stack(stem_embs[s:e])).to(dev)
-                    y = torch.from_numpy(np.array(labels[s:e], np.float32)).to(dev)
-                    m = torch.from_numpy(np.array(masks[s:e], np.float32)).to(dev)
-                    logits = fusion(scalars_t, raw_t, stem_t)
-                    loss = (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * m).sum() / m.sum().clamp_min(1)
-                    (loss / (len(scalars)/micro_f)).backward()
-                    micro_losses.append(float(loss.detach().cpu()))
-                torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
-                lv=float(sum(micro_losses)/len(micro_losses)) if micro_losses else 0.0
-                losses.extend(micro_losses)
-                if (bi+1) % a.log_every == 0:
-                    print(json.dumps({"phase": "train_batch", "epoch": ep, "batch": bi+1, "loss": round(lv,4), "cache_files": len(list(cache_dir.glob("*.npz")))}), flush=True)
-            else:
-                with torch.inference_mode():
-                    for s in range(0, len(scalars), micro_f):
-                        e = min(s+micro_f, len(scalars))
-                        scalars_t = torch.from_numpy(np.stack(scalars[s:e])).to(dev)
-                        raw_t = torch.from_numpy(np.stack(raw_embs[s:e])).to(dev)
-                        stem_t = torch.from_numpy(np.stack(stem_embs[s:e])).to(dev)
-                        logits = fusion(scalars_t, raw_t, stem_t)
-                        probs = torch.sigmoid(logits).cpu().numpy()
-                        all_pf.extend(probs[:,0].tolist()); all_pv.extend(probs[:,1].tolist()); all_pm.extend(probs[:,2].tolist())
-        if train:
-            return float(np.mean(losses)) if losses else 0.0
-        else:
-            return all_pf, all_pv, all_pm, all_vp, all_mp
-
-    for ep in range(1, a.epochs + 1):
-        print(json.dumps({"phase": "epoch_start", "epoch": ep}), flush=True)
-        tr_loss = run_split(tr_rows, train=True)
-        pf, pv, pm, vp, mp = run_split(va_rows, train=False)
-        met = metrics(va_rows, pf, pv, pm)
-        # CPS from presence (frozen) — compute AUCs
-        try:
-            yvp = np.array([num(r["expected_voice_present"]) for r in va_rows], float)
-            ymp = np.array([num(r["expected_music_present"]) for r in va_rows], float)
-            met["voice_auc"] = float(roc_auc_score(yvp, np.array(vp, float)))
-            met["music_auc"] = float(roc_auc_score(ymp, np.array(mp, float)))
-            met["cps"] = 0.5 * (met["voice_auc"] + met["music_auc"])
-            met["score"] = 0.9 * met["ads"] + 0.1 * met["cps"]
-        except Exception:
-            met["cps"] = met["score"] = float("nan")
-        # save per-epoch predictions + metrics (official contract)
-        (a.run_dir / f"epoch_{ep:02d}").mkdir(exist_ok=True)
-        (a.run_dir / f"epoch_{ep:02d}" / "metrics.json").write_text(json.dumps(met, indent=2) + "\n")
-        with (a.run_dir / f"predictions_validation_epoch{ep:02d}.csv").open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["ID","FILE_FAKE_PROB","VOICE_FAKE_PROB","MUSIC_FAKE_PROB","VOICE_PRESENT_PROB","MUSIC_PRESENT_PROB"])
-            w.writeheader()
-            for r, a0, b0, c0, d0, e0 in zip(va_rows, pf, pv, pm, vp, mp):
-                w.writerow({"ID": r["sample_id"], "FILE_FAKE_PROB": f"{a0:.6f}", "VOICE_FAKE_PROB": f"{b0:.6f}", "MUSIC_FAKE_PROB": f"{c0:.6f}", "VOICE_PRESENT_PROB": d0, "MUSIC_PRESENT_PROB": e0})
-        rec = {"epoch": ep, "train_loss": tr_loss, **met, "cached_sonics": len(list(cache_dir.glob("*.npz")))}
-        history.append(rec)
-        print(json.dumps(rec), flush=True)
-        sched.step()
-
-    meta = V5Meta.create(a.proj_dim, a.hidden_dim, "500m")
-    # scalar stats from cache? use dummy zero-mean for now (logits already)
-    s_mean = np.zeros(5, np.float32); s_std = np.ones(5, np.float32)
-    torch.save(payload(fusion.cpu(), meta, s_mean, s_std, history), a.run_dir / "v5_checkpoint.pt")
-    (a.run_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
-    print(json.dumps({"done": True, "history": history}), flush=True)
+    args = arguments()
+    if min(args.epochs, args.batch_size, args.checkpoint_every) < 1:
+        raise ValueError("Epochs, batch size, and checkpoint interval must be positive")
+    manifest = args.manifest.resolve(); cache_contract = contract(manifest); cache = Cache(args.cache_dir)
+    cache.validate_contract(cache_contract)
+    rows = [row for row in read_manifest(manifest) if row["split"] in {args.train_split, args.validation_split}]
+    data = assemble(rows, cache, torch.device(args.device), args.run_dir.resolve() / "events.jsonl")
+    config = Config(args.epochs, args.batch_size, args.projection, args.hidden, args.lr, args.seed)
+    train(data.split(args.train_split), data.split(args.validation_split), cache_contract, args.run_dir.resolve(),
+          config, torch.device(args.device), args.checkpoint_every, args.resume, args.max_steps)
 
 
 if __name__ == "__main__":
