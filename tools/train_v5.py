@@ -77,7 +77,7 @@ def main():
     ap.add_argument("--run-dir", type=Path, required=True)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--proj-dim", type=int, default=64)
     ap.add_argument("--hidden-dim", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
