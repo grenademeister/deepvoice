@@ -176,7 +176,7 @@ def main():
                 er_batch = sonics_embed_batched(son, need_raw, dev)
                 es_batch = sonics_embed_batched(son, need_stem, dev)
                 for (sid, idx, cp), er, es in zip(pending, er_batch, es_batch):
-                    tmp = str(cp) + ".tmp"
+                    tmp = str(cp).replace(".npz", ".tmp.npz")
                     np.savez_compressed(tmp, raw=er, stem=es)
                     import os as _os
                     _os.replace(tmp, str(cp))
