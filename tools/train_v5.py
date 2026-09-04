@@ -2,11 +2,11 @@
 """V5 batched trainer — implicit SONICS cache after epoch 1.
 
 Epoch 1: full forward (HTDemucs → DF500M / SONICS raw+stem / Artifact / PANNs) + backprop.
-         SONICS raw/stem embeddings are cached in RAM per sample_id.
+         SONICS raw/stem embeddings are saved to sonics_cache per sample_id.
 Epoch 2+: SONICS encoder is skipped, cached embeddings are reused.
 
 Batched: DataLoader batch_size groups, SONICS encoder runs batched per group.
-No explicit feature files — cache lives only in this process.
+No explicit feature files — cache is on disk, no RAM growth.
 """
 from __future__ import annotations
 import argparse, csv, json, sys
@@ -85,6 +85,8 @@ def main():
     a = ap.parse_args()
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     a.run_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = a.run_dir / "sonics_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     dev = torch.device(a.device)
 
     # --- frozen models ---
@@ -118,8 +120,6 @@ def main():
     va_rows = [r for r in rows_all if r["split"] == "validation"]
     print(f"train {len(tr_rows)} val {len(va_rows)}", flush=True)
 
-    # in-RAM SONICS cache: sample_id -> (raw_emb, stem_emb) as np [D]
-    cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     fusion = V5Fusion(proj_dim=a.proj_dim, hidden_dim=a.hidden_dim).to(dev)
     opt = torch.optim.AdamW(fusion.parameters(), lr=a.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
@@ -154,22 +154,32 @@ def main():
                 labels.append([num(r["expected_file_fake"]), num(r["expected_voice_fake"]), num(r["expected_music_fake"])])
                 masks.append([1.0, num(r["expected_voice_present"]), num(r["expected_music_present"])])
                 all_vp.append(vp); all_mp.append(mp)
-                # SONICS cache
-                if sid in cache:
-                    er, es = cache[sid]
-                    raw_embs.append(er); stem_embs.append(es)
+                # SONICS file cache: epoch 1 saves, epoch 2+ reuses
+                cp = cache_dir / f"{sid}.npz"
+                if cp.exists():
+                    try:
+                        d = np.load(str(cp))
+                        er, es = d["raw"], d["stem"]
+                        raw_embs.append(er); stem_embs.append(es)
+                    except Exception:
+                        pending.append((sid, len(raw_embs), cp))
+                        raw_embs.append(None); stem_embs.append(None)
+                        need_raw.append(load_audio(r["local_path"]))
+                        need_stem.append(acc)
                 else:
-                    # defer
-                    pending.append((sid, len(raw_embs)))
+                    pending.append((sid, len(raw_embs), cp))
                     raw_embs.append(None); stem_embs.append(None)
                     need_raw.append(load_audio(r["local_path"]))
                     need_stem.append(acc)
-            # batched SONICS for uncached
+            # batched SONICS for uncached (and save to disk immediately)
             if need_raw:
                 er_batch = sonics_embed_batched(son, need_raw, dev)
                 es_batch = sonics_embed_batched(son, need_stem, dev)
-                for (sid, idx), er, es in zip(pending, er_batch, es_batch):
-                    cache[sid] = (er, es)
+                for (sid, idx, cp), er, es in zip(pending, er_batch, es_batch):
+                    tmp = str(cp) + ".tmp"
+                    np.savez_compressed(tmp, raw=er, stem=es)
+                    import os as _os
+                    _os.replace(tmp, str(cp))
                     raw_embs[idx] = er
                     stem_embs[idx] = es
             scalars_t = torch.from_numpy(np.stack(scalars)).to(dev)
@@ -214,7 +224,7 @@ def main():
             w.writeheader()
             for r, a0, b0, c0, d0, e0 in zip(va_rows, pf, pv, pm, vp, mp):
                 w.writerow({"ID": r["sample_id"], "FILE_FAKE_PROB": f"{a0:.6f}", "VOICE_FAKE_PROB": f"{b0:.6f}", "MUSIC_FAKE_PROB": f"{c0:.6f}", "VOICE_PRESENT_PROB": d0, "MUSIC_PRESENT_PROB": e0})
-        rec = {"epoch": ep, "train_loss": tr_loss, **met, "cached_sonics": len(cache)}
+        rec = {"epoch": ep, "train_loss": tr_loss, **met, "cached_sonics": len(list(cache_dir.glob("*.npz")))}
         history.append(rec)
         print(json.dumps(rec), flush=True)
         sched.step()
