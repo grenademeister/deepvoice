@@ -80,7 +80,7 @@ def main():
     ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--proj-dim", type=int, default=64)
     ap.add_argument("--hidden-dim", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=20260904)
     a = ap.parse_args()
@@ -315,9 +315,11 @@ def main():
                     _os.replace(tmp, str(cp))
                     raw_embs[idx] = er
                     stem_embs[idx] = es
-            # Fusion micro-batched bsz=4 -> 4 forwards/backprops per 1 HTDemucs (B=16) pass
+            # Fusion micro-batched bsz=4 -> accumulate 4 micros then 1 opt step per outer B=16
             micro_f = 4
             if train:
+                opt.zero_grad(set_to_none=True)
+                micro_losses=[]
                 for s in range(0, len(scalars), micro_f):
                     e = min(s+micro_f, len(scalars))
                     scalars_t = torch.from_numpy(np.stack(scalars[s:e])).to(dev)
@@ -327,10 +329,11 @@ def main():
                     m = torch.from_numpy(np.array(masks[s:e], np.float32)).to(dev)
                     logits = fusion(scalars_t, raw_t, stem_t)
                     loss = (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * m).sum() / m.sum().clamp_min(1)
-                    opt.zero_grad(set_to_none=True); loss.backward()
-                    torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
-                    lv=float(loss.detach().cpu())
-                    losses.append(lv)
+                    (loss / (len(scalars)/micro_f)).backward()
+                    micro_losses.append(float(loss.detach().cpu()))
+                torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
+                lv=float(sum(micro_losses)/len(micro_losses)) if micro_losses else 0.0
+                losses.extend(micro_losses)
                 if (bi+1) % a.log_every == 0:
                     print(json.dumps({"phase": "train_batch", "epoch": ep, "batch": bi+1, "loss": round(lv,4), "cache_files": len(list(cache_dir.glob("*.npz")))}), flush=True)
             else:
