@@ -195,28 +195,49 @@ def main():
                     batch_norm.append(norm)
                     means.append(mean); stds.append(std)
                 if batch_norm:
-                    batch_tensor = _thd.stack(batch_norm).to(dev)  # [B_need, C, T]
-                    with _thd.inference_mode():
-                        from demucs.apply import apply_model as _apply
-                        sources = _apply(htd, batch_tensor, device=dev, shifts=0, split=True, overlap=0.25, progress=False)  # [B, 4, C, T]
-                    # sources: [B, nsrc, C, T]
+                    # micro-batched HTDemucs to avoid OOM: chunk B_need into 4
                     vocal_idx = htd.sources.index("vocals")
-                    for bj, orig_idx in enumerate([i for i in need_hdemucs_idx if i is not None]):
-                        # denorm
-                        mean = means[bj]; std = stds[bj]
-                        src = sources[bj] * std + mean  # [nsrc, C, T]
-                        voice_t = src[vocal_idx].mean(0, keepdim=True)
-                        music_sources = [src[i] for i, n in enumerate(htd.sources) if n != "vocals"]
-                        music_t = _thd.stack(music_sources).sum(0).mean(0, keepdim=True)
-                        # resample to 16k
-                        voice = torchaudio.functional.resample(voice_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
-                        acc = torchaudio.functional.resample(music_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
-                        voices[orig_idx] = voice; accs[orig_idx] = acc
-                        # save stem cache
-                        sid0 = batch[orig_idx]["sample_id"]
-                        scp = stems_cache / f"{sid0}.npz"
-                        __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
-                        __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
+                    # need_hdemucs_idx filtered order == batch_norm order
+                    need_orig_indices = [i for i in need_hdemucs_idx if i is not None]
+                    micro_h = 4
+                    # iterate micro batches with local padding
+                    for micro_s in range(0, len(batch_norm), micro_h):
+                        micro_e = min(micro_s+micro_h, len(batch_norm))
+                        chunk_norm = batch_norm[micro_s:micro_e]
+                        chunk_means = means[micro_s:micro_e]
+                        chunk_stds = stds[micro_s:micro_e]
+                        chunk_orig = need_orig_indices[micro_s:micro_e]
+                        # local max for this micro batch
+                        local_max = max(x.shape[-1] for x in chunk_norm)
+                        # re-pad if needed (already padded to global max, but trim to local max to save VRAM)
+                        trimmed = []
+                        for x in chunk_norm:
+                            if x.shape[-1] > local_max:
+                                trimmed.append(x[:, :local_max])
+                            elif x.shape[-1] < local_max:
+                                trimmed.append(_thd.nn.functional.pad(x, (0, local_max - x.shape[-1])))
+                            else:
+                                trimmed.append(x)
+                        batch_tensor = _thd.stack(trimmed).to(dev)  # [micro, C, T]
+                        with _thd.inference_mode():
+                            from demucs.apply import apply_model as _apply
+                            sources = _apply(htd, batch_tensor, device=dev, shifts=0, split=True, overlap=0.25, progress=False)  # [micro, 4, C, T]
+                        for bj2, orig_idx in enumerate(chunk_orig):
+                            mean = chunk_means[bj2]; std = chunk_stds[bj2]
+                            src = sources[bj2] * std + mean  # [nsrc, C, T]
+                            voice_t = src[vocal_idx].mean(0, keepdim=True)
+                            music_sources = [src[i] for i, n in enumerate(htd.sources) if n != "vocals"]
+                            music_t = _thd.stack(music_sources).sum(0).mean(0, keepdim=True)
+                            voice = torchaudio.functional.resample(voice_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
+                            acc = torchaudio.functional.resample(music_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
+                            voices[orig_idx] = voice; accs[orig_idx] = acc
+                            sid0 = batch[orig_idx]["sample_id"]
+                            scp = stems_cache / f"{sid0}.npz"
+                            __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
+                            __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
+                        del batch_tensor, sources
+                        if dev.type=="cuda":
+                            _thd.cuda.empty_cache()
                 # handle silence cases (already zero)
                 for idx, r in enumerate(batch):
                     if voices[idx] is None:
