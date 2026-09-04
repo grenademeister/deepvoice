@@ -144,7 +144,9 @@ def main():
                 vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
                 with torch.inference_mode():
                     wav = torch.from_numpy(voice).float().to(dev)  # 1-D [T] — backbone unsqueezes to [1,T]
-                    dfp = float(torch.softmax(df(input_values=wav).logits, dim=-1)[0, fake_idx].item())
+                    out = df(input_values=wav)
+                    logits = out["logits"] if isinstance(out, dict) else out.logits
+                    dfp = float(torch.softmax(logits, dim=-1)[0, fake_idx].item())
                 raw44 = load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE)
                 ar, ast = predict_artifactnet_raw_and_stem(art, raw_audio=raw44, raw_sample_rate=ARTIFACTNET_SAMPLE_RATE, music_stem=acc, stem_sample_rate=16000)
                 sc = np.array([dfp, ar, ast, vp, mp], np.float32)
