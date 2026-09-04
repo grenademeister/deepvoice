@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--run-dir", type=Path, required=True)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--proj-dim", type=int, default=64)
     ap.add_argument("--hidden-dim", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -131,7 +132,7 @@ def main():
         dl = DataLoader(ds, batch_size=a.batch_size, shuffle=train, collate_fn=lambda x: x, num_workers=0)
         all_pf, all_pv, all_pm, all_vp, all_mp = [], [], [], [], []
         losses = []
-        for batch in dl:
+        for bi, batch in enumerate(dl):
             # per-batch: run frozen branches
             scalars, raw_embs, stem_embs, labels, masks = [], [], [], [], []
             # collect uncached sonics inputs for batched encoder
@@ -192,7 +193,10 @@ def main():
                 loss = (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * m).sum() / m.sum().clamp_min(1)
                 opt.zero_grad(set_to_none=True); loss.backward()
                 torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
-                losses.append(float(loss.detach().cpu()))
+                lv=float(loss.detach().cpu())
+                losses.append(lv)
+                if (bi+1) % a.log_every == 0:
+                    print(json.dumps({"phase": "train_batch", "epoch": ep, "batch": bi+1, "loss": round(lv,4), "cache_files": len(list(cache_dir.glob("*.npz")))}), flush=True)
             else:
                 with torch.inference_mode():
                     probs = torch.sigmoid(logits).cpu().numpy()
@@ -203,6 +207,7 @@ def main():
             return all_pf, all_pv, all_pm, all_vp, all_mp
 
     for ep in range(1, a.epochs + 1):
+        print(json.dumps({"phase": "epoch_start", "epoch": ep}), flush=True)
         tr_loss = run_split(tr_rows, train=True)
         pf, pv, pm, vp, mp = run_split(va_rows, train=False)
         met = metrics(va_rows, pf, pv, pm)
