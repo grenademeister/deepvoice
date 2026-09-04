@@ -140,25 +140,105 @@ def main():
             # collect uncached sonics inputs for batched encoder
             need_raw, need_stem, need_ids = [], [], []
             pending = []
-            # Phase 1: HTDemucs stem file cache + PANNs (epoch1 saves stems, epoch2+ loads)
+            # Phase 1: Batched HTDemucs with stem file cache (epoch1 computes batched, epoch2 loads)
             voices, accs, raw44s, vps, mps = [], [], [], [], []
-            for r in batch:
+            # split batch into cached stems vs need HTDemucs
+            need_hdemucs_idx = []
+            need_paths = []
+            for idx, r in enumerate(batch):
                 sid0 = r["sample_id"]
                 scp = stems_cache / f"{sid0}.npz"
                 if scp.exists():
                     try:
                         d = __import__("numpy").load(str(scp))
-                        voice, acc = d["voice"], d["acc"]
+                        voices.append(d["voice"]); accs.append(d["acc"])
+                        # placeholder for later PANNs/raw
+                        need_hdemucs_idx.append(None)
+                        continue
                     except Exception:
-                        voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
+                        pass
+                # need compute
+                need_hdemucs_idx.append(idx)
+                need_paths.append(r["local_path"])
+                voices.append(None); accs.append(None)
+            # batched HTDemucs for uncached (single apply_model call)
+            if need_paths:
+                import torch as _thd
+                from script import load_track
+                import torchaudio
+                # load and normalize per-sample, pad to max
+                wavs = []
+                means, stds, lens = [], [], []
+                max_len = 0
+                for pth in need_paths:
+                    wf = load_track(pth, htd.audio_channels, htd.samplerate).float()  # [C, T]
+                    mono = wf.mean(0)
+                    mean = mono.mean(); std = mono.std()
+                    if float(std) < 1e-8:
+                        # silence: create zeros at target sr
+                        length = round(wf.shape[-1] * 16000 / htd.samplerate)
+                        wavs.append((__import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32), __import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32), mean, std, True))
+                        continue
+                    norm = (wf - mean) / std
+                    wavs.append((norm, mean, std, False))
+                    max_len = max(max_len, norm.shape[-1])
+                # pad and stack
+                batch_norm = []
+                valid_idx = []
+                for item in wavs:
+                    if len(item)==5: # silence case
+                        continue
+                    norm, mean, std, _ = item
+                    pad = max_len - norm.shape[-1]
+                    if pad>0:
+                        norm = _thd.nn.functional.pad(norm, (0, pad))
+                    batch_norm.append(norm)
+                    means.append(mean); stds.append(std)
+                if batch_norm:
+                    batch_tensor = _thd.stack(batch_norm).to(dev)  # [B_need, C, T]
+                    with _thd.inference_mode():
+                        from demucs.apply import apply_model as _apply
+                        sources = _apply(htd, batch_tensor, device=dev, shifts=0, split=True, overlap=0.25, progress=False)  # [B, 4, C, T]
+                    # sources: [B, nsrc, C, T]
+                    vocal_idx = htd.sources.index("vocals")
+                    for bi, orig_idx in enumerate([i for i in need_hdemucs_idx if i is not None]):
+                        # denorm
+                        mean = means[bi]; std = stds[bi]
+                        src = sources[bi] * std + mean  # [nsrc, C, T]
+                        voice_t = src[vocal_idx].mean(0, keepdim=True)
+                        music_sources = [src[i] for i, n in enumerate(htd.sources) if n != "vocals"]
+                        music_t = _thd.stack(music_sources).sum(0).mean(0, keepdim=True)
+                        # resample to 16k
+                        voice = torchaudio.functional.resample(voice_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
+                        acc = torchaudio.functional.resample(music_t, htd.samplerate, 16000)[0].cpu().numpy().astype(__import__("numpy").float32)
+                        voices[orig_idx] = voice; accs[orig_idx] = acc
+                        # save stem cache
+                        sid0 = batch[orig_idx]["sample_id"]
+                        scp = stems_cache / f"{sid0}.npz"
                         __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
                         __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
-                else:
-                    voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
-                    __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
-                    __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
+                # handle silence cases (already zero)
+                for idx, r in enumerate(batch):
+                    if voices[idx] is None:
+                        # silence
+                        sid0 = r["sample_id"]
+                        scp = stems_cache / f"{sid0}.npz"
+                        # create zeros if not already
+                        if not scp.exists():
+                            wf = load_track(r["local_path"], htd.audio_channels, htd.samplerate).float()
+                            length = round(wf.shape[-1] * 16000 / htd.samplerate)
+                            voice = __import__("numpy").zeros(max(1,length), dtype=__import__("numpy").float32)
+                            acc = voice.copy()
+                            voices[idx]=voice; accs[idx]=acc
+                            __import__("numpy").savez_compressed(str(scp).replace(".npz",".tmp.npz"), voice=voice, acc=acc)
+                            __import__("os").replace(str(scp).replace(".npz",".tmp.npz"), str(scp))
+                        else:
+                            d=__import__("numpy").load(str(scp))
+                            voices[idx]=d["voice"]; accs[idx]=d["acc"]
+            # PANNs/raw per-sample (cheap)
+            for r in batch:
                 vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
-                voices.append(voice); accs.append(acc); vps.append(vp); mps.append(mp)
+                vps.append(vp); mps.append(mp)
                 raw44s.append(load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE))
             # Chunked batched DF500M: [B,T] -> [B,2] with micro-batch to stay <8GB
             df_probs = []
