@@ -138,31 +138,17 @@ def main():
             # collect uncached sonics inputs for batched encoder
             need_raw, need_stem, need_ids = [], [], []
             pending = []
-            # --- batch collect HTDemucs/Artifact/PANNs first (per-sample cheap, keep simple) ---
-            voices, accs, raw44s, vps, mps = [], [], [], [], []
             for r in batch:
-                voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
-                vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
-                voices.append(voice); accs.append(acc); vps.append(vp); mps.append(mp)
-                raw44s.append(load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE))
-            # --- batched DF500M on voices [B, T] ---
-            import torch as _t2
-            with _t2.inference_mode():
-                # pad to max length in batch (all 10s = 160k, but pad safely)
-                max_len = max(v.shape[0] for v in voices)
-                # truncate/pad to max_len
-                batch_voices = np.stack([np.pad(v, (0, max_len - v.shape[0])) if v.shape[0] < max_len else v[:max_len] for v in voices])
-                wavs_t = _t2.from_numpy(batch_voices).float().to(dev)  # [B, T]
-                out = df(input_values=wavs_t)
-                logits_b = out["logits"] if isinstance(out, dict) else out.logits  # [B, 2]
-                probs_b = _t2.softmax(logits_b.float(), dim=-1)[:, fake_idx].detach().cpu().numpy()  # [B]
-            # --- assemble per-sample scalars + SONICS cache check ---
-            for idx, r in enumerate(batch):
                 sid = r["sample_id"]
-                dfp = float(probs_b[idx])
-                vp, mp = vps[idx], mps[idx]
-                acc = accs[idx]
-                raw44 = raw44s[idx]
+                # HTDemucs + DF500M + Artifact + PANNs
+                voice, acc, acc_native = separate_voice_and_music(r["local_path"], htd, dev)
+                vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
+                with torch.inference_mode():
+                    wav = torch.from_numpy(voice).float().to(dev)  # 1-D [T] — backbone unsqueezes to [1,T]
+                    out = df(input_values=wav)
+                    logits = out["logits"] if isinstance(out, dict) else out.logits
+                    dfp = float(torch.softmax(logits, dim=-1)[0, fake_idx].item())
+                raw44 = load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE)
                 ar, ast = predict_artifactnet_raw_and_stem(art, raw_audio=raw44, raw_sample_rate=ARTIFACTNET_SAMPLE_RATE, music_stem=acc, stem_sample_rate=16000)
                 sc = np.array([dfp, ar, ast, vp, mp], np.float32)
                 scalars.append(logit(sc))
