@@ -201,10 +201,10 @@ def main():
                         sources = _apply(htd, batch_tensor, device=dev, shifts=0, split=True, overlap=0.25, progress=False)  # [B, 4, C, T]
                     # sources: [B, nsrc, C, T]
                     vocal_idx = htd.sources.index("vocals")
-                    for bi, orig_idx in enumerate([i for i in need_hdemucs_idx if i is not None]):
+                    for bj, orig_idx in enumerate([i for i in need_hdemucs_idx if i is not None]):
                         # denorm
-                        mean = means[bi]; std = stds[bi]
-                        src = sources[bi] * std + mean  # [nsrc, C, T]
+                        mean = means[bj]; std = stds[bj]
+                        src = sources[bj] * std + mean  # [nsrc, C, T]
                         voice_t = src[vocal_idx].mean(0, keepdim=True)
                         music_sources = [src[i] for i, n in enumerate(htd.sources) if n != "vocals"]
                         music_t = _thd.stack(music_sources).sum(0).mean(0, keepdim=True)
@@ -294,24 +294,34 @@ def main():
                     _os.replace(tmp, str(cp))
                     raw_embs[idx] = er
                     stem_embs[idx] = es
-            scalars_t = torch.from_numpy(np.stack(scalars)).to(dev)
-            raw_t = torch.from_numpy(np.stack(raw_embs)).to(dev)
-            stem_t = torch.from_numpy(np.stack(stem_embs)).to(dev)
-            y = torch.from_numpy(np.array(labels, np.float32)).to(dev)
-            m = torch.from_numpy(np.array(masks, np.float32)).to(dev)
-            logits = fusion(scalars_t, raw_t, stem_t)
+            # Fusion micro-batched bsz=4 -> 4 forwards/backprops per 1 HTDemucs (B=16) pass
+            micro_f = 4
             if train:
-                loss = (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * m).sum() / m.sum().clamp_min(1)
-                opt.zero_grad(set_to_none=True); loss.backward()
-                torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
-                lv=float(loss.detach().cpu())
-                losses.append(lv)
+                for s in range(0, len(scalars), micro_f):
+                    e = min(s+micro_f, len(scalars))
+                    scalars_t = torch.from_numpy(np.stack(scalars[s:e])).to(dev)
+                    raw_t = torch.from_numpy(np.stack(raw_embs[s:e])).to(dev)
+                    stem_t = torch.from_numpy(np.stack(stem_embs[s:e])).to(dev)
+                    y = torch.from_numpy(np.array(labels[s:e], np.float32)).to(dev)
+                    m = torch.from_numpy(np.array(masks[s:e], np.float32)).to(dev)
+                    logits = fusion(scalars_t, raw_t, stem_t)
+                    loss = (F.binary_cross_entropy_with_logits(logits, y, reduction="none") * m).sum() / m.sum().clamp_min(1)
+                    opt.zero_grad(set_to_none=True); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(fusion.parameters(), 1.0); opt.step()
+                    lv=float(loss.detach().cpu())
+                    losses.append(lv)
                 if (bi+1) % a.log_every == 0:
                     print(json.dumps({"phase": "train_batch", "epoch": ep, "batch": bi+1, "loss": round(lv,4), "cache_files": len(list(cache_dir.glob("*.npz")))}), flush=True)
             else:
                 with torch.inference_mode():
-                    probs = torch.sigmoid(logits).cpu().numpy()
-                    all_pf.extend(probs[:,0].tolist()); all_pv.extend(probs[:,1].tolist()); all_pm.extend(probs[:,2].tolist())
+                    for s in range(0, len(scalars), micro_f):
+                        e = min(s+micro_f, len(scalars))
+                        scalars_t = torch.from_numpy(np.stack(scalars[s:e])).to(dev)
+                        raw_t = torch.from_numpy(np.stack(raw_embs[s:e])).to(dev)
+                        stem_t = torch.from_numpy(np.stack(stem_embs[s:e])).to(dev)
+                        logits = fusion(scalars_t, raw_t, stem_t)
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        all_pf.extend(probs[:,0].tolist()); all_pv.extend(probs[:,1].tolist()); all_pm.extend(probs[:,2].tolist())
         if train:
             return float(np.mean(losses)) if losses else 0.0
         else:
