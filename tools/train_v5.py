@@ -199,7 +199,7 @@ def main():
                     vocal_idx = htd.sources.index("vocals")
                     # need_hdemucs_idx filtered order == batch_norm order
                     need_orig_indices = [i for i in need_hdemucs_idx if i is not None]
-                    micro_h = 4
+                    micro_h = 2
                     # iterate micro batches with local padding
                     for micro_s in range(0, len(batch_norm), micro_h):
                         micro_e = min(micro_s+micro_h, len(batch_norm))
