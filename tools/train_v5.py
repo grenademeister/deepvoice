@@ -156,8 +156,9 @@ def main():
                 out = df(input_values=wavs_t)
                 logits_b = out["logits"] if isinstance(out, dict) else out.logits  # [B, 2]
                 probs_b = _t2.softmax(logits_b.float(), dim=-1)[:, fake_idx].detach().cpu().numpy()  # [B]
-            # --- assemble per-sample scalars ---
+            # --- assemble per-sample scalars + SONICS cache check ---
             for idx, r in enumerate(batch):
+                sid = r["sample_id"]
                 dfp = float(probs_b[idx])
                 vp, mp = vps[idx], mps[idx]
                 acc = accs[idx]
