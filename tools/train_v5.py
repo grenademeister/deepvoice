@@ -138,23 +138,39 @@ def main():
             # collect uncached sonics inputs for batched encoder
             need_raw, need_stem, need_ids = [], [], []
             pending = []
+            # Phase 1: HTDemucs + PANNs per-sample (collect), DF batched in micro-batches
+            voices, accs, raw44s, vps, mps = [], [], [], [], []
             for r in batch:
-                sid = r["sample_id"]
-                # HTDemucs + DF500M + Artifact + PANNs
-                voice, acc, acc_native = separate_voice_and_music(r["local_path"], htd, dev)
+                voice, acc, _ = separate_voice_and_music(r["local_path"], htd, dev)
                 vp, mp = predict_presence(panns, vi, mi, load_audio(r["local_path"]))
-                with torch.inference_mode():
-                    wav = torch.from_numpy(voice).float().to(dev)  # 1-D [T] — backbone unsqueezes to [1,T]
-                    out = df(input_values=wav)
-                    logits = out["logits"] if isinstance(out, dict) else out.logits
-                    dfp = float(torch.softmax(logits, dim=-1)[0, fake_idx].item())
-                raw44 = load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE)
+                voices.append(voice); accs.append(acc); vps.append(vp); mps.append(mp)
+                raw44s.append(load_audio(r["local_path"], ARTIFACTNET_SAMPLE_RATE))
+            # Chunked batched DF500M: [B,T] -> [B,2] with micro-batch to stay <8GB
+            df_probs = []
+            micro = 4  # 4*160k fits in 4GB headroom
+            with torch.inference_mode():
+                for i in range(0, len(voices), micro):
+                    chunk = voices[i:i+micro]
+                    max_len = max(v.shape[0] for v in chunk)
+                    batch_arr = np.stack([np.pad(v, (0, max_len - v.shape[0])) if v.shape[0] < max_len else v[:max_len] for v in chunk])
+                    wavs_t = torch.from_numpy(batch_arr).float().to(dev)
+                    out = df(input_values=wavs_t)
+                    logits_b = out["logits"] if isinstance(out, dict) else out.logits
+                    probs = torch.softmax(logits_b.float(), dim=-1)[:, fake_idx].detach().cpu().numpy()
+                    df_probs.extend(probs.tolist())
+            # Phase 2: assemble scalars
+            for idx, r in enumerate(batch):
+                dfp = float(df_probs[idx])
+                vp, mp = vps[idx], mps[idx]
+                acc = accs[idx]
+                raw44 = raw44s[idx]
                 ar, ast = predict_artifactnet_raw_and_stem(art, raw_audio=raw44, raw_sample_rate=ARTIFACTNET_SAMPLE_RATE, music_stem=acc, stem_sample_rate=16000)
                 sc = np.array([dfp, ar, ast, vp, mp], np.float32)
                 scalars.append(logit(sc))
                 labels.append([num(r["expected_file_fake"]), num(r["expected_voice_fake"]), num(r["expected_music_fake"])])
                 masks.append([1.0, num(r["expected_voice_present"]), num(r["expected_music_present"])])
                 all_vp.append(vp); all_mp.append(mp)
+                sid = r["sample_id"]
                 # SONICS file cache: epoch 1 saves, epoch 2+ reuses
                 cp = cache_dir / f"{sid}.npz"
                 if cp.exists():
